@@ -44,7 +44,7 @@
             android:id="@+id/bookVolumeText"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Volume: BookScan_Part01.pdf"
+            android:text="@string/default_volume_header"
             android:textColor="#E0E0E0"
             android:textSize="13sp"
             android:textStyle="bold" />
@@ -54,7 +54,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Heap: 0% | Storage: 0%"
+            android:text="@string/default_resource_telemetry"
             android:textColor="#81C784"
             android:textSize="12sp" />
 
@@ -63,7 +63,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:layout_marginTop="4dp"
-            android:text="Spread #1: Ready (0/4 shots)"
+            android:text="@string/default_capture_status"
             android:textColor="#64B5F6"
             android:textSize="12sp" />
     </LinearLayout>
@@ -94,13 +94,22 @@
             android:text="@string/complete_spread"
             android:textColor="#FFFFFF" />
 
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/sessionSettingsButton"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="160dp"
+            android:layout_height="44dp"
+            android:layout_marginTop="8dp"
+            android:text="@string/session_settings"
+            android:textColor="#FFFFFF" />
+
         <com.google.android.material.switchmaterial.SwitchMaterial
             android:id="@+id/lanFallbackSwitch"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
+            android:layout_marginTop="10dp"
             android:checked="true"
-            android:text="LAN Fallback"
+            android:text="@string/lan_fallback_label"
             android:textColor="#FFFFFF" />
     </LinearLayout>
 

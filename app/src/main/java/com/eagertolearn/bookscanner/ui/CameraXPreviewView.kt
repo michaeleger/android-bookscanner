@@ -11,10 +11,11 @@ import android.util.Log
 import android.view.Surface
 import android.view.View
 import android.widget.FrameLayout
-import androidx.camera.core.AspectRatio
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -67,16 +68,19 @@ class CameraXPreviewView @JvmOverloads constructor(
                 cameraProvider = provider
 
                 val rotation = previewView.display?.rotation ?: Surface.ROTATION_90
+                val resolutionSelector = ResolutionSelector.Builder()
+                    .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                    .build()
 
                 val preview = Preview.Builder()
-                    .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                    .setResolutionSelector(resolutionSelector)
                     .setTargetRotation(rotation)
                     .build()
                     .also { it.setSurfaceProvider(previewView.surfaceProvider) }
 
                 val capture = ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                    .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                    .setResolutionSelector(resolutionSelector)
                     .setTargetRotation(rotation)
                     .setJpegQuality(95)
                     .build()

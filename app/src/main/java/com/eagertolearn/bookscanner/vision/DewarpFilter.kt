@@ -120,7 +120,9 @@ class DewarpFilter(
                 val strip = gray.submat(Rect(x0, 0, stripWidth, rows))
                 try {
                     Core.reduce(strip, rowMeans, 1, Core.REDUCE_AVG, CvType.CV_32F)
-                    if (rowMeans.get(0, 0, profiles[idx]) < rows) {
+                    // OpenCV 4.9 Mat.get returns bytes copied, not elements. A full CV_32F
+                    // column is rows * 4 bytes. A shorter copy would leave the tail stale.
+                    if (rowMeans.get(0, 0, profiles[idx]) < rows * Float.SIZE_BYTES) {
                         profiles[idx].fill(0f)
                     }
                 } finally {

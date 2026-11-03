@@ -33,7 +33,8 @@ import kotlin.math.roundToInt
  * - Fusion keeps one CV_32FC3 accumulator (the running sum) plus 8-bit weight, darkest-color,
  *   and luminance mats. It does not keep every warped shot resident, so a 4-shot 12MP burst
  *   stays one pipeline instead of four full float frames. The base frame is released after
- *   [resolveBurstConflicts], before the gutter profile is built. The native peak is the
+ *   [resolveBurstConflicts], before the gutter profile is built. That step adds one 8-bit
+ *   plane of the base luminance and releases it before returning. The native peak is the
  *   warp in the alignment loop (~350MB at 12MP). The division runs in row strips so it stays
  *   below that even with the base frame resident.
  */
@@ -416,10 +417,15 @@ class StitcherEngine {
      * Separates glare from misregistered text. The per-pixel rule is [PageGeometry.fusionChoice].
      *
      * Where one shot sees ink and another sees paper, the mean doubles the glyph and the
-     * darkest color would stamp that ink onto the paper. Those pixels keep [base]. A highlight
-     * is the other case: the darker shot is still paper and the lift is modest. A 5×5 opening
-     * drops thin edge halos that pass the gray test. If the opened mask covers more than
-     * [MAX_SPECULAR_FRACTION] of the frame, the exposure itself changed and the mean is kept.
+     * darkest color would stamp that ink onto the paper. Those pixels keep [base], unless
+     * [base] itself is clipped there. Clipped base over surviving ink is the glare the burst
+     * is for, so those pixels take [darkest] with no opening: a 5×5 open would erase the
+     * strokes. A highlight on paper is the other case. The darker shot is still paper and the
+     * lift is modest. A 5×5 opening drops thin edge halos that pass the gray test. If that
+     * opened mask covers more than [MAX_SPECULAR_FRACTION] of the frame, the exposure itself
+     * changed and the mean is kept.
+     *
+     * [baseGray] is one CV_8UC1 plane, released here. The division above stays in row strips.
      */
     private fun resolveBurstConflicts(
         fused: Mat,
@@ -431,14 +437,27 @@ class StitcherEngine {
         val range = Mat()
         val maskA = Mat()
         val maskB = Mat()
+        val baseGray = Mat()
         var kernel: Mat? = null
         try {
+            Imgproc.cvtColor(base, baseGray, Imgproc.COLOR_BGR2GRAY)
             Core.subtract(maxGray, minGray, range)
 
+            // Ink against a much brighter sample. maskA keeps every such pixel.
             Imgproc.threshold(minGray, maskA, PageGeometry.INK_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY_INV)
             Imgproc.threshold(range, maskB, PageGeometry.MISALIGN_RANGE.toDouble(), 255.0, Imgproc.THRESH_BINARY)
             Core.bitwise_and(maskA, maskB, maskA)
+
+            // Same pixels where the base shot is clipped and some shot is strictly above the
+            // specular level. 8-bit THRESH_BINARY is strict >, so 244 keeps gray >= 245.
+            // baseGray is reused as that second mask once its luminance has been read.
+            Imgproc.threshold(baseGray, maskB, PageGeometry.SPECULAR_GRAY.toDouble() - 1.0, 255.0, Imgproc.THRESH_BINARY)
+            Core.bitwise_and(maskA, maskB, maskB)
+            Imgproc.threshold(maxGray, baseGray, PageGeometry.SPECULAR_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+            Core.bitwise_and(maskB, baseGray, maskB)
+
             base.copyTo(fused, maskA)
+            darkest.copyTo(fused, maskB)
 
             Imgproc.threshold(maxGray, maskA, PageGeometry.SPECULAR_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY)
             Imgproc.threshold(minGray, maskB, PageGeometry.PAPER_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY)
@@ -459,6 +478,7 @@ class StitcherEngine {
             }
         } finally {
             kernel?.release()
+            baseGray.release()
             maskB.release()
             maskA.release()
             range.release()

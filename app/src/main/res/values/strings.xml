@@ -2,5 +2,12 @@
     <string name="app_name">BookScanner</string>
     <string name="capture_spread_shot">Capture Burst Shot</string>
     <string name="complete_spread">Force Complete Spread</string>
+    <string name="session_settings">Session / Book</string>
+    <string name="book_name_label">Book Name</string>
+    <string name="lan_fallback_url_label">LAN Fallback URL</string>
+    <string name="lan_fallback_label">LAN Fallback</string>
+    <string name="default_volume_header">Volume: BookScan_Part01.pdf</string>
+    <string name="default_resource_telemetry">Heap: 0% | Storage: 0%</string>
+    <string name="default_capture_status">Spread #1: Ready (0/4 shots)</string>
     <string name="resource_warning_banner">60% Resource Threshold Exceeded: Segmenting Volume &amp; Offloading Queue to LAN</string>
 </resources>

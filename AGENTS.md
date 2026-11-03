@@ -14,9 +14,11 @@ This file establishes constraints, standards, and handoff protocols for all CLI 
 * **Preserve Document Artifacts:**
   * Do NOT use aggressive 1-bit binarization (Otsu/Sauvola). 
   * Use CLAHE on the luminance channel (LAB color space) to retain yellow/pink/green highlighter ink and pencil marginalia.
-* **60% Hard Intercept Rule:**
-  * The system must segment documents into volumes (`[BookName]_Part01.pdf`) when total device storage or JVM heap usage exceeds 60%.
-  * Trigger UI warning and, if enabled, dump raw batch queues to the local Linux LAN fallback server.
+* **60% Volume Rule:**
+  * Segment into `[BookName]_PartXX.pdf` when the session has used 60% of the free space recorded at the start of the current volume, or when JVM heap use exceeds 60% of max heap.
+  * A storage breach always starts a new volume and re-baselines free space. A heap-only breach rolls once per episode, because rolling frees no heap, and stays latched until heap recovers.
+  * Show a UI warning. Capture continues through a 60% breach. Refuse a burst only when it would leave less than 256MB free.
+  * If LAN fallback is enabled, offload that spread's raw shots to the local Linux server and skip the local PDF for that spread. Leave other queued spreads on device.
 
 ---
 

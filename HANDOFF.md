@@ -175,3 +175,103 @@
 * **Target for Next Agent:**
   - **Grok:** glare-over-ink in `fusionChoice` / `resolveBurstConflicts` (above). If you add a base-gray plane, release it in the same `finally`. Keep `divideByWeight` strip-wise. A full-frame float temporary there pushes the peak above the alignment loop again.
   - **Gemini:** the Pass 3 open list is unchanged (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite).
+
+---
+
+## Pass 7 — Grok (markdown check)
+* **Last Updated:** 2026-11-03 03:01 EST | Grok (Math & Computer Vision Specialist)
+* **Scope:** `AGENTS.md` and `HANDOFF.md` against the current sources. No vision code changed. Tests were not re-run.
+* **Corrected:** `AGENTS.md` still said to segment when total device storage or heap exceeds 60%, and to dump raw batch queues. The Pass 2 user decision and the code measure storage against `ScanSessionStore.baselineFreeBytes`, roll a heap-only breach once per episode (`resolveVolumePart`), keep capturing until fewer than 256MB would remain (`canAcceptBurst`), warn in the UI, and offload only the spread about to be processed (`SpreadProcessingWorker` passes that spread's directory to `LanFallbackSyncWorker`).
+* **Checked, still accurate:**
+  - Pass 6 glare note. `fusionChoice(40f, 250f)` is `BASE` (`min ≤ 140` wins over a saturated max). `resolveBurstConflicts` has no base-gray plane. `misalignedInkKeepsTheBaseShot` locks that result in. The split Pass 6 suggested is still open.
+  - Pass 6 `Mat.get` note. OpenCV 4.9.0 `mat_copy_data` returns `count * sizeof(T)` bytes (`modules/java/generator/src/cpp/Mat.cpp`). `estimateBaselinePolynomial` still compares that to `rows`. A full `rows×1` CV_32F copy returns `rows * 4`, so the check does not fire on the success path.
+  - Pass 6 mask note. BASE is `min ≤ 140`, DARKEST is `min > 180`. The 5×5 opening only removes pixels. Strip division is still 256 rows inside `divideByWeight`, with `fusedBgr` created there via `dst8.create` before the strip loop.
+  - Pass 5 geometry. Stations, ±4%/±2% clamps, ±6% search, cylindrical `u`, wide-valley limits (16% width, 6% flat-floor reject, 8% inset cap), and the 15 `PageGeometryTest` cases match the sources.
+  - Gemini open list. No `abiFilters`, `setForeground`, book-name field, or `ResolutionSelector`. `setTargetAspectRatio` and `http://192.168.1.100:8085/...` are still hardcoded. Each spread still rewrites the volume. The debug APK on disk is **159MB** compressed and still packages arm64-v8a, armeabi-v7a, x86, and x86_64 (Pass 2's 166MB was the earlier package).
+* **Modified Files:** `AGENTS.md`, `HANDOFF.md`.
+* **Target for Next Agent:**
+  - **Grok:** unchanged from Pass 6. Glare-over-ink in `fusionChoice` / `resolveBurstConflicts`. If you add a base-gray plane, release it in the same `finally`. Keep `divideByWeight` strip-wise. The `rowMeans.get` check should be `< rows * 4` or be removed.
+  - **Gemini:** unchanged open list (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite). Current debug APK is 159MB compressed across four ABIs.
+
+---
+
+## Pass 8 — Gemini (Lead Architect & Scaffolder)
+* **Last Updated:** 2026-11-03 05:17 EST | Gemini (Lead Architect & Scaffolder)
+* **Build:** `testDebugUnitTest` (15/15), `assembleDebug`, `lintDebug` (0 errors) → **BUILD SUCCESSFUL**. Debug APK size reduced from **159MB** to **52MB** (`arm64-v8a` only). `server/lan_fallback_server.py` PDF assembly smoke-tested on host Python 3.14.
+* **Current State:**
+  - **Working Features (resolved Gemini open list from Passes 2–7):**
+    - **ABI Filter:** Added `ndk { abiFilters += "arm64-v8a" }` in `app/build.gradle.kts`, shrinking the packaged APK from 159MB (4 ABIs) to 52MB. Note: `org.opencv:opencv:4.9.0` prebuilt `libc++_shared.so` triggers `Aligned16KB` lint warning (4KB ELF segment alignment, acceptable on `targetSdk = 34` per `AGENTS.md`).
+    - **CameraX `ResolutionSelector`:** Replaced deprecated `setTargetAspectRatio(AspectRatio.RATIO_4_3)` in `CameraXPreviewView.kt` with `ResolutionSelector` (`AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY`).
+    - **Per-Spread PDF Staging & O(n) Volume Merge (`PdfVolumeAssembler.kt`):** Eliminated the `O(n²)` full-volume rewrite and 2× temp file storage spike on every spread. `appendSpreadWithOcr` now writes a self-contained 2-page searchable PDF (`volumes/[BookName]_PartXX_spreads/spread_XXXX.pdf`) per spread (`O(1)` I/O), and `finalizeVolume` / `finalizeAllPendingVolumes` merges staged spreads into `volumes/[BookName]_PartXX.pdf` in a single `O(n)` pass via `PDFMergerUtility` (`MemoryUsageSetting.setupTempFileOnly`) on volume roll, session close (`MainActivity.onStop`), or user request.
+    - **Foreground WorkManager Execution (`SpreadProcessingWorker.kt`, `AndroidManifest.xml`):** Added `FOREGROUND_SERVICE` / `FOREGROUND_SERVICE_DATA_SYNC` permissions, merged `foregroundServiceType="dataSync"` onto `SystemForegroundService`, and implemented `setForeground` / `getForegroundInfo` so long multi-spread bursts are not cut off by WorkManager's 10-minute background execution window. Also added `SpreadProcessingWorker.enqueueFinalize` on the same sequential `UNIQUE_PIPELINE_NAME` work chain and wired `KEY_LAN_SERVER_URL` through to `LanFallbackSyncWorker`.
+    - **Session & Book Settings UI (`MainActivity.kt`, `ScanSessionStore.kt`, `BurstCaptureManager.kt`, `activity_main.xml`, `strings.xml`):** Added a compact Session & Book Settings dialog to configure `bookName`, `lanServerUrl`, and trigger `New Book / Reset` (which enqueues volume finalization for the previous session and resets counters). Fixed `BurstCaptureManager.CaptureState.Idle` so the telemetry bar accurately reflects the current spread index and captured shot count (`1/4`, `2/4`, `3/4`) between burst shots and across restarts.
+    - **LAN Fallback Server PDF Assembly (`server/lan_fallback_server.py`):** Added `assemble_volume_pdf` and `_parse_jpeg_header` to embed enhanced spread JPEGs directly into `lan_fallback_output/[BookName]_PartXX.pdf` via PDF 1.4 `/DCTDecode` XObjects (atomic `.tmp` + rename, natural spread sorting, zero third-party PDF dependencies).
+  - **Pending / Stubs:**
+    - Vision/math items from Pass 6/7 remain untouched in `PageGeometry.kt`, `StitcherEngine.kt`, and `DewarpFilter.kt` per user directive (ready for Grok).
+* **Modified Files:**
+  - `app/build.gradle.kts`
+  - `app/src/main/AndroidManifest.xml`
+  - `app/src/main/res/values/strings.xml`
+  - `app/src/main/res/layout/activity_main.xml`
+  - `app/src/main/java/com/eagertolearn/bookscanner/core/ScanSessionStore.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/core/BurstCaptureManager.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/ui/CameraXPreviewView.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/ui/MainActivity.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/pdf/PdfVolumeAssembler.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/worker/SpreadProcessingWorker.kt`
+  - `server/lan_fallback_server.py`
+  - `HANDOFF.md`
+* **Target for Next Agent:**
+  - **Grok (Math & CV):** Resolve glare-over-ink in `PageGeometry.fusionChoice` / `StitcherEngine.resolveBurstConflicts` (when `minGray <= 140` and `maxGray > 245`, check whether the base shot itself is specularly clipped `>= SPECULAR_GRAY` and select `DARKEST` instead of `BASE`; release any added base-gray `Mat` in `finally` and keep `divideByWeight` strip-wise) + add a `PageGeometryTest` case. Also fix or remove the `rowMeans.get(0, 0, profiles[idx]) < rows` byte-vs-float check in `DewarpFilter.estimateBaselinePolynomial`.
+  - **Claude (Auditor):** Audit `PdfVolumeAssembler.finalizeVolume` (`PDFMergerUtility` temp-file lifecycle, idempotency across partial merges, and staging cleanup), `SpreadProcessingWorker` (`enqueueFinalize` ordering on `UNIQUE_PIPELINE_NAME` and `setForeground` handling), `ScanSessionStore.resetSession` / `BurstCaptureManager.resetForNewSession` thread safety, and `server/lan_fallback_server.py` `assemble_volume_pdf`.
+
+---
+
+## Pass 9 — Grok (Math & Computer Vision)
+* **Last Updated:** 2026-11-03 05:27 EST | Grok (Math & Computer Vision Specialist)
+* **Build:** `testDebugUnitTest` → 16 tests, all passing (`PageGeometryTest`). `assembleDebug` → **BUILD SUCCESSFUL**. Still synthetic profiles only. Remap and fusion have not been run on a real page image (no device, no host OpenCV).
+* **Glare over ink, fixed.** `fusionChoice(40, 250)` was `BASE` for every reference pixel, so a clipped base shot kept the glare and threw away the ink in another shot. The rule now takes `baseGray`. Ink against a brighter sample stays `BASE` when the reference is the ink (`baseGray` 40 or 200) or is only at the specular floor with nothing brighter (`baseGray` 245 and `maxGray` 245). It returns `DARKEST` when `minGray <= 140`, `maxGray > 245`, and `baseGray >= 245` (`40/250` with base 250, `40/255` with base 245, `100/250` with base 248). Paper glare and the mean band are unchanged, including cream paper at 160 under a clip of 255.
+* **Masks.** `StitcherEngine.resolveBurstConflicts` builds that split before the paper-highlight mask. The ink mask is copied from the base shot, then the clipped-base subset is overwritten from the darkest shot. That subset is not opened and is not gated by the 35% fraction: a 5×5 open would delete the strokes, and a page of washed text can exceed 35%. The 5×5 opening and the 35% exposure gate stay on the paper-highlight mask only. One CV_8UC1 `baseGray` is allocated inside the `try` and released in the same `finally`, including the `pixels <= 0` return. After the luminance is read it is reused as the `max > 245` mask, so there is no third full-frame mask. `divideByWeight` is still 256-row strips with no new full-frame float.
+* **`Mat.get` byte count.** `estimateBaselinePolynomial` now treats a short copy as failure when `get` returns fewer than `rows * Float.SIZE_BYTES` bytes. A full CV_32F column (`rows * 4`) is accepted. OpenCV 4.9 `mat_copy_data` returns bytes.
+* **Assumptions:**
+  - A clipped reference pixel has no remaining information. If the darkest shot has ink there because of curl rather than because the glyph belongs there, that ink is still written.
+  - `baseGray <= maxGray`, because the max is seeded from the reference shot.
+  - Gray 245 with no brighter sample is not specular. The paper-glare test is strict `>`.
+* **Modified Files:**
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/PageGeometry.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/DewarpFilter.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/StitcherEngine.kt`
+  - `app/src/test/java/com/eagertolearn/bookscanner/vision/PageGeometryTest.kt`
+  - `HANDOFF.md`
+* **Target for Next Agent:**
+  - **Claude (Auditor):** `StitcherEngine.resolveBurstConflicts` now holds `baseGray` (CV_8UC1) and reuses it as a mask after the luminance threshold. Both `darkest.copyTo` calls, the `pixels <= 0` return, and the `finally` releases. Confirm the ink-recovery mask cannot be overwritten by the later paper-highlight `darkest.copyTo` (min ≤ 140 vs min > 180). `divideByWeight` must stay strip-wise. Peak should remain the alignment loop: `baseGray` exists only after the accumulator and weight are released.
+  - **Gemini:** the Pass 3 open list was cleared in Pass 8. No new scaffolding item from this pass.
+
+---
+
+## Pass 10 — Claude (Auditor, final pass over Passes 7–9)
+* **Last Updated:** 2026-11-03 05:43 EST | Claude (Auditor & Safety Guard)
+* **Build:** `testDebugUnitTest` 19/19 (16 `PageGeometryTest`, 3 new `PdfMergeTest`), `assembleDebug`, `lintDebug` (0 errors) → **BUILD SUCCESSFUL**. Debug APK 53MB. Server assembler smoke-tested with a byte-exact xref check (no PDF reader on host). Still nothing has run on a device.
+* **Fixed:**
+  - **Volume merge OOM (`PdfVolumeAssembler.finalizeVolume`).** In pdfbox-android 2.0.27, `PDFMergerUtility` defaults to `PDFBOX_LEGACY_MODE` (checked against the bytecode). That mode loads every source through `RandomAccessBufferedFileInputStream` (a 1000 × 4KB page cache each) and keeps all of them open until `save`. Heap was about 4MB per staged spread, so a 100-spread volume needed ~400MB and threw `OutOfMemoryError`, which `catch (Exception)` does not catch. The process crashed, and the finalize work at the head of the chain crashed it again on every restart. `OPTIMIZE_RESOURCES_MODE` closes each source but ignores `destinationDocumentInformation`, which would lose `BookScannerLastSpread`. New `pdf/PdfMerge.kt` runs that mode's page loop itself. `PDFCloneUtility` deep-copies streams, so each source closes right after its pages are cloned, and the doc info is set directly.
+  - **Merge disk spike.** A merge needs ~2× the merged size free (destination scratch plus output) while the sources still exist. After a storage-breach roll, about 40% of the baseline remains against a ~60% volume, so the merge ran out of space partway through. `finalizeVolume` now compares `PdfMerge.requiredFreeBytes` (2 × inputs + 64MB) with `ScanSessionStore.currentFreeBytes()` and defers if short. The staged spreads stay, and `finalizeAllPendingVolumes` retries later. A stale `_PartXX.pdf.tmp` is deleted before a merge starts.
+  - **Roll-time merge failure cost a spread its attempts (`SpreadProcessingWorker`).** The roll is persisted before the merge, so a retry never came back to the merge, but the exception still used one of the spread's three attempts. That merge is now wrapped in try/catch and logged.
+  - **Session reset data loss (`MainActivity`, `ScanSessionStore.resetSession`, `BurstCaptureManager`).** Three paths:
+    1. Spreads still queued from the old session ran after the reset. Each read the *new* session's volume part (old book name, wrong part) and called `markSpreadCommitted(oldIndex)` on the reset counter. The new session's spreads `1..oldIndex` were then skipped as already committed, and their raw shots deleted.
+    2. Resetting to a name that already had `_Part01.pdf` (including "New Book / Reset" with the same name) made `appendSpreadWithOcr` report new spreads up to that volume's last-spread marker as `alreadyCommitted`. Their raw shots were deleted, and later spreads were appended to the old book's file.
+    3. A reset with a shot in flight reset the store but not `BurstCaptureManager.spreadIndex`.
+
+    Now `startNewSession` refuses while a shot is in flight, while any spread-tagged work is unfinished (`SpreadProcessingWorker.hasPendingSpreads`, new `spread_work` tag), or if the spread index changed during that check. The new session starts at `PdfVolumeAssembler.nextFreeVolumePart(book)`. Spread counters are no longer reset: they stay monotonic, so new spread directories can't collide with failed spreads' leftover raw shots. `resetForNewSession` now `check`s for a shot in flight instead of returning silently.
+  - **LAN server `assemble_volume_pdf`** kept every JPEG of the volume in memory (`b"".join`) on every POST. It now streams objects to the `.tmp` file one JPEG at a time and deletes the `.tmp` on failure. 4-component JPEGs map to `/DeviceCMYK`.
+* **Checked, no change:**
+  - Grok Pass 9 memory: `baseGray` (CV_8UC1) is created inside the `try` after `accumulator`/`weight` are released, and released in the same `finally`. Reusing it as the `max > 245` mask is sound. Ink-recovery (`min ≤ 140`) and paper-highlight (`min > 180`) masks are disjoint, and both copy from `darkest`. The `resolveBurstConflicts` step is ~180MB at 12MP, below the ~348MB alignment peak. `divideByWeight` is still strip-wise. `Mat.get` byte check is correct.
+  - `enqueueFinalize` shares `UNIQUE_PIPELINE_NAME` with `APPEND_OR_REPLACE`, so it runs after the spreads queued before it. `setForeground` failure is caught and processing continues. `getForegroundInfo` is supplied.
+* **Open (not changed; owners named):**
+  - **Grok, math (possible regression in Pass 9):** `fusionChoice` treats `baseGray ≥ 245` as clipped. Clean white paper commonly reads 245–254 before CLAHE. Where the base is bright paper and another shot is misregistered by a stroke width, `fusionChoice(40, 250, base = 250)` now returns `DARKEST` and stamps a ghost glyph. That is the case `BASE` existed to block. Possible tightenings: require a hard clip (`base ≥ 254`), or require base to sit `GLARE_RANGE` above the other shots' paper level nearby. Either needs a synthetic misregistration test.
+  - **Gemini / user:** `MainActivity.onStop` enqueues a full-volume rewrite each time the app is backgrounded with staged spreads. Someone who backgrounds between pages brings back O(n²) I/O and a 2× disk spike each time. Suggest merging only on roll, Save & Merge, and new book, or when staged spreads exceed a count.
+  - **User decision:** the 60% storage budget leaves no room for the merge after a storage roll (above). The merge is now deferred instead of failing, but on a nearly full device that volume stays as staged spreads. A real fix is an append-only incremental-update volume writer or a smaller storage budget.
+  - **Minor:** PDFBox scratch files (`cacheDir/PDFBox*.tmp`) leak if the process dies mid-merge. The server still rebuilds the whole volume synchronously before responding, which is O(volume) per upload and can outlast the client's timeout on large volumes.
+* **Modified Files:** `pdf/PdfMerge.kt` (new), `pdf/PdfVolumeAssembler.kt`, `worker/SpreadProcessingWorker.kt`, `core/ScanSessionStore.kt`, `core/BurstCaptureManager.kt`, `ui/MainActivity.kt`, `server/lan_fallback_server.py`, `app/src/test/.../pdf/PdfMergeTest.kt` (new), `HANDOFF.md`.
+* **Target for Next Agent:**
+  - **Grok:** the `baseGray ≥ 245` ghosting case above, with a test.
+  - **Gemini:** the `onStop` finalize policy. A device run of a 100+-spread volume merge to confirm the heap bound.

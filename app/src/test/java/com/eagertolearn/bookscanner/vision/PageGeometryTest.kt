@@ -190,23 +190,40 @@ class PageGeometryTest {
 
     @Test
     fun misalignedInkKeepsTheBaseShot() {
-        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(40f, 250f))
-        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(100f, 250f))
+        // The reference shot holds the ink. A brighter sample is curl, not glare to chase.
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(40f, 250f, baseGray = 40f))
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(100f, 250f, baseGray = 80f))
+        // Paper in the reference, ink in another shot, reference not clipped.
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(40f, 250f, baseGray = 200f))
+    }
+
+    @Test
+    fun glareOverInkOnTheBaseShotSelectsTheDarkest() {
+        // min <= 140 and max > 245 used to return BASE. When the reference pixel is the
+        // clipped one, the darkest shot is the text the burst is meant to keep.
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(40f, 250f, baseGray = 250f))
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(40f, 255f, baseGray = 245f))
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(100f, 250f, baseGray = 248f))
+        // Exactly SPECULAR_GRAY in every shot is not above the specular test.
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(40f, 245f, baseGray = 245f))
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(40f, 250f, baseGray = 244f))
     }
 
     @Test
     fun glareOnPaperSelectsTheDarkestShot() {
-        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(210f, 255f))
-        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(190f, 250f))
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(210f, 255f, baseGray = 255f))
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(210f, 255f, baseGray = 210f))
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(190f, 250f, baseGray = 190f))
     }
 
     @Test
     fun agreeingPixelsKeepTheMean() {
-        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(180f, 200f))
-        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(30f, 45f))
+        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(180f, 200f, baseGray = 190f))
+        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(30f, 45f, baseGray = 30f))
         // Cream paper under a hard clip is left as the mean: the darker value is not ink,
-        // and it is not bright enough to call a highlight.
-        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(160f, 255f))
+        // and it is not bright enough to call a highlight. A clipped reference does not
+        // promote it, because this branch never reads baseGray.
+        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(160f, 255f, baseGray = 255f))
     }
 
     private fun textRowProfile(

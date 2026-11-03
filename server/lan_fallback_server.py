@@ -99,6 +99,168 @@ def process_uploaded_spread(saved_files: List[Path], out_dir: Path) -> List[Path
     return [left_out, right_out]
 
 
+def _parse_jpeg_header(jpeg_bytes: bytes) -> Tuple[int, int, int]:
+    """Extracts (width, height, components) from raw JPEG SOF markers without external libs."""
+    n = len(jpeg_bytes)
+    if n < 4 or jpeg_bytes[0] != 0xFF or jpeg_bytes[1] != 0xD8:
+        return (1600, 2400, 3)
+    idx = 2
+    sof_markers = {
+        0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+        0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF,
+    }
+    while idx + 1 < n:
+        if jpeg_bytes[idx] != 0xFF:
+            idx += 1
+            continue
+        while idx < n and jpeg_bytes[idx] == 0xFF:
+            idx += 1
+        if idx >= n:
+            break
+        marker = jpeg_bytes[idx]
+        idx += 1
+        if marker in (0xD8, 0xD9) or 0xD0 <= marker <= 0xD7:
+            continue
+        if idx + 2 > n:
+            break
+        seg_len = (jpeg_bytes[idx] << 8) | jpeg_bytes[idx + 1]
+        if seg_len < 2 or idx + seg_len > n:
+            break
+        if marker in sof_markers and seg_len >= 8:
+            height = (jpeg_bytes[idx + 3] << 8) | jpeg_bytes[idx + 4]
+            width = (jpeg_bytes[idx + 5] << 8) | jpeg_bytes[idx + 6]
+            components = jpeg_bytes[idx + 7]
+            if width > 0 and height > 0:
+                return (width, height, components)
+        idx += seg_len
+    return (1600, 2400, 3)
+
+
+def _natural_sort_key(path: Path) -> List[object]:
+    parts = re.split(r"(\d+)", path.name)
+    return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+
+def collect_volume_page_jpegs(volume_dir: Path) -> List[Path]:
+    """Collects ordered page JPEGs across all spread directories in `volume_dir`."""
+    if not volume_dir.exists():
+        return []
+    pages: List[Path] = []
+    spread_dirs = sorted(
+        (d for d in volume_dir.iterdir() if d.is_dir()),
+        key=_natural_sort_key,
+    )
+    for sdir in spread_dirs:
+        left = sdir / "left_enhanced.jpg"
+        right = sdir / "right_enhanced.jpg"
+        if left.is_file() and right.is_file():
+            pages.extend([left, right])
+        else:
+            raw_shots = sorted(
+                (
+                    f for f in sdir.iterdir()
+                    if f.is_file() and f.suffix.lower() in (".jpg", ".jpeg")
+                ),
+                key=_natural_sort_key,
+            )
+            if raw_shots:
+                pages.append(raw_shots[0])
+    return pages
+
+
+def assemble_volume_pdf(volume_dir: Path, pdf_path: Path) -> Path | None:
+    """
+    Assembles `[BookName]_PartXX.pdf` from all offloaded spreads in `volume_dir` by embedding
+    the JPEG page streams directly via PDF 1.4 `/DCTDecode` XObjects (atomic `.tmp` + rename).
+
+    Objects are written to the `.tmp` file as they are produced, one JPEG in memory at a time.
+    The whole volume is rebuilt on every upload, so cost is O(volume) per spread.
+    """
+    page_files = collect_volume_page_jpegs(volume_dir)
+    if not page_files:
+        return None
+
+    # Object 1: Catalog, Object 2: Pages, then (page, content, image) per page.
+    num_pages = len(page_files)
+    total_objects = 2 + num_pages * 3
+    offsets: Dict[int, int] = {}
+    page_obj_ids = [3 + i * 3 for i in range(num_pages)]
+    kids_ref = " ".join(f"{pid} 0 R" for pid in page_obj_ids)
+
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = pdf_path.with_suffix(".pdf.tmp")
+    try:
+        with tmp_path.open("wb") as out:
+            out.write(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+
+            def emit_obj(obj_id: int, *parts: bytes) -> None:
+                offsets[obj_id] = out.tell()
+                out.write(f"{obj_id} 0 obj\n".encode("ascii"))
+                for part in parts:
+                    out.write(part)
+                out.write(b"\nendobj\n")
+
+            emit_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
+            emit_obj(2, f"<< /Type /Pages /Kids [{kids_ref}] /Count {num_pages} >>".encode("ascii"))
+
+            for idx, jpeg_path in enumerate(page_files):
+                page_id = 3 + idx * 3
+                content_id = page_id + 1
+                img_id = page_id + 2
+
+                jpeg_bytes = jpeg_path.read_bytes()
+                img_w, img_h, comps = _parse_jpeg_header(jpeg_bytes)
+                color_space = {1: "/DeviceGray", 4: "/DeviceCMYK"}.get(comps, "/DeviceRGB")
+                page_w_pt = 612.0
+                page_h_pt = round(page_w_pt * (float(img_h) / float(max(1, img_w))), 2)
+
+                emit_obj(
+                    page_id,
+                    (
+                        f"<< /Type /Page /Parent 2 0 R "
+                        f"/MediaBox [0 0 {page_w_pt:.2f} {page_h_pt:.2f}] "
+                        f"/Resources << /XObject << /Im0 {img_id} 0 R >> >> "
+                        f"/Contents {content_id} 0 R >>"
+                    ).encode("ascii"),
+                )
+
+                content_stream = f"q {page_w_pt:.2f} 0 0 {page_h_pt:.2f} 0 0 cm /Im0 Do Q".encode("ascii")
+                emit_obj(
+                    content_id,
+                    f"<< /Length {len(content_stream)} >>\nstream\n".encode("ascii"),
+                    content_stream,
+                    b"\nendstream",
+                )
+
+                emit_obj(
+                    img_id,
+                    (
+                        f"<< /Type /XObject /Subtype /Image /Width {img_w} /Height {img_h} "
+                        f"/ColorSpace {color_space} /BitsPerComponent 8 "
+                        f"/Filter /DCTDecode /Length {len(jpeg_bytes)} >>\nstream\n"
+                    ).encode("ascii"),
+                    jpeg_bytes,
+                    b"\nendstream",
+                )
+                del jpeg_bytes
+
+            xref_offset = out.tell()
+            out.write(f"xref\n0 {total_objects + 1}\n0000000000 65535 f \n".encode("ascii"))
+            for obj_id in range(1, total_objects + 1):
+                out.write(f"{offsets[obj_id]:010d} 00000 n \n".encode("ascii"))
+            out.write(
+                (
+                    f"trailer\n<< /Size {total_objects + 1} /Root 1 0 R >>\n"
+                    f"startxref\n{xref_offset}\n%%EOF\n"
+                ).encode("ascii")
+            )
+        tmp_path.replace(pdf_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    return pdf_path
+
+
 class LanFallbackHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         if self.path != "/api/v1/ingest-spread":
@@ -128,7 +290,8 @@ class LanFallbackHandler(BaseHTTPRequestHandler):
         spread_dir_name = safe_name(fields.get("spread_dir", ""), "spread_unknown")
 
         volume_label = f"{book_name}_Part{volume_part:02d}"
-        spread_out_dir = OUTPUT_ROOT / volume_label / spread_dir_name
+        volume_dir = OUTPUT_ROOT / volume_label
+        spread_out_dir = volume_dir / spread_dir_name
         spread_out_dir.mkdir(parents=True, exist_ok=True)
 
         saved_paths: List[Path] = []
@@ -140,11 +303,13 @@ class LanFallbackHandler(BaseHTTPRequestHandler):
             saved_paths.append(dest)
 
         processed = process_uploaded_spread(saved_paths, spread_out_dir)
+        volume_pdf_path = OUTPUT_ROOT / f"{volume_label}.pdf"
+        assembled_pdf = assemble_volume_pdf(volume_dir, volume_pdf_path)
 
         payload = json.dumps(
             {
                 "status": "ok",
-                "volume": f"{volume_label}.pdf",
+                "volume": str(assembled_pdf) if assembled_pdf else f"{volume_label}.pdf",
                 "spread": spread_dir_name,
                 "received_shots": len(saved_paths),
                 "processed_files": [str(p) for p in processed],

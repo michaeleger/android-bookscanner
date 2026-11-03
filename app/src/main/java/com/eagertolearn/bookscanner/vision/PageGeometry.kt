@@ -52,9 +52,11 @@ internal object PageGeometry {
      * Per-pixel fusion rule. OpenCV `THRESH_BINARY` is strict `>`, and `THRESH_BINARY_INV`
      * is `<=`, so the comparisons here match the masks in `StitcherEngine`.
      *
-     * Glare is a modest lift that stays on paper: the darker shot is still above [PAPER_GRAY]
-     * and the gap is at most [MAX_GLARE_LIFT]. Ink against near-white paper has a much larger
-     * gap and a dark minimum; that is misalignment, and the base shot is kept. Anything else
+     * Glare on paper is a modest lift: the darker shot is still above [PAPER_GRAY] and the
+     * gap is at most [MAX_GLARE_LIFT]. Ink against paper is a larger gap with a dark minimum.
+     * That is misalignment, and the base shot is kept, unless the base pixel itself is at
+     * or above [SPECULAR_GRAY] and the brightest shot is above it. Then the base is the glare
+     * the burst exists to remove, and the darkest shot still holds the ink. Anything else
      * keeps the weighted mean.
      */
     const val SPECULAR_GRAY = 245f
@@ -97,10 +99,10 @@ internal object PageGeometry {
         /** Shots agree, or the disagreement is too mild to call. */
         MEAN,
 
-        /** Highlight on paper: write the darkest shot. */
+        /** Highlight on paper, or glare on the reference shot over ink another shot still holds. */
         DARKEST,
 
-        /** Ink in one shot and paper in another: keep the reference shot. */
+        /** Ink in one shot and paper in another, and the reference shot is not clipped. */
         BASE
     }
 
@@ -254,14 +256,23 @@ internal object PageGeometry {
         return ShiftEstimate(pixels, fineBest)
     }
 
-    fun fusionChoice(minGray: Float, maxGray: Float): FusionChoice {
+    /**
+     * [baseGray] is the reference shot at this pixel. It is at most [maxGray], because the
+     * max is taken over the reference and the aligned shots.
+     */
+    fun fusionChoice(minGray: Float, maxGray: Float, baseGray: Float): FusionChoice {
         val range = maxGray - minGray
-        val glare = maxGray > SPECULAR_GRAY &&
+        val glareOnPaper = maxGray > SPECULAR_GRAY &&
             minGray > PAPER_GRAY &&
             range > GLARE_RANGE &&
             range <= MAX_GLARE_LIFT
-        if (glare) return FusionChoice.DARKEST
-        if (minGray <= INK_GRAY && range > MISALIGN_RANGE) return FusionChoice.BASE
+        if (glareOnPaper) return FusionChoice.DARKEST
+        if (minGray <= INK_GRAY && range > MISALIGN_RANGE) {
+            // base == SPECULAR_GRAY stays BASE unless some shot is strictly brighter, matching
+            // the paper-glare test (max > SPECULAR_GRAY) and an 8-bit threshold at that level.
+            if (baseGray >= SPECULAR_GRAY && maxGray > SPECULAR_GRAY) return FusionChoice.DARKEST
+            return FusionChoice.BASE
+        }
         return FusionChoice.MEAN
     }
 
