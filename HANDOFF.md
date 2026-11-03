@@ -135,3 +135,26 @@
 * **Target for Next Agent:**
   - **Grok:** the three math findings above. The baseline aliasing is the priority, because the dewarp currently acts on measurement noise for most real sags. Add a `PageGeometryTest` case for a wide (σ ≥ 3%) gutter.
   - **Gemini:** the Pass 3 open list is unchanged (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite).
+
+---
+
+## Pass 5 — Grok (Math & Computer Vision)
+* **Last Updated:** 2026-11-03 02:40 EST | Grok (Math & Computer Vision Specialist)
+* **Build:** `testDebugUnitTest` → 15 tests, all passing (`PageGeometryTest`). `assembleDebug` → **BUILD SUCCESSFUL**. Still synthetic profiles only. Remap and fusion have not been run on a real page image (no device, no host OpenCV).
+* **Baseline aliasing, fixed.** The centroid of a periodic strip wraps past half a line pitch, so a 1–3% sag was noise or the wrong sign. `PageGeometry.verticalShiftPx` correlates the text-block envelopes first (top and bottom margins are the anchor), then refines the lag inside ±0.45 pitch on the high-passed row profiles. Search range is ±6% of page height. A flat strip, a full-bleed strip with no margin, or an ambiguous envelope returns 0. `DewarpFilter.estimateBaselinePolynomial` reduces three full-height gray strips (no full-page Sobel) and clamps the spine station to ±4% and the outer station to ±2%. Checked past half a pitch and at one full pitch (48px on a 1600px page, pitch 47), including a gain/offset change.
+* **Wide gutter, fixed.** Shoulders are the uphill walk, not a fixed `width/40` window, so a wide shadow is scored against the page instead of its own slope. Valleys up to 16% of the spread width are allowed. A run wider than 6% whose floor occupies more than 75% of the half-depth width is still a figure and is rejected. The excluded core stays the half-depth run, capped at 8% of the width on each side. A Gaussian at 0.52·W is found for σ = 3% and σ = 5% at depths 20 and 30. The narrow-valley, rule, flat, and dark-block tests still pass.
+* **Fusion ghosts.** `PageGeometry.fusionChoice` is the per-pixel rule, applied in bulk by `StitcherEngine.resolveBurstConflicts`. Highlight: darker shot still paper (gray > 180), max > 245, lift in (20, 90]. Those pixels take the darkest shot after a 5×5 opening, and only if that mask is ≤ 35% of the frame. Ink against paper (min ≤ 140 and range > 30) keeps the base shot, so a curled-page mismatch is not averaged and not stamped darker. The band between those two (antialiased gray, or cream paper under a hard clip) stays the weighted mean. Not checked on a photograph.
+* **Assumptions:**
+  - The strip must include the text block's top or bottom margin. A full-bleed page is left unshifted.
+  - Line pitch is the first autocorrelation peak above 0.25, between 7px and 10% of the strip.
+  - Spine tilt is still a constant 29.8°.
+  - A flat dark band wider than 6% of the spread is a figure, even when it sits on the spine.
+* **Modified Files:**
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/PageGeometry.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/DewarpFilter.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/StitcherEngine.kt`
+  - `app/src/test/java/com/eagertolearn/bookscanner/vision/PageGeometryTest.kt`
+  - `HANDOFF.md`
+* **Target for Next Agent:**
+  - **Claude (Auditor):** `StitcherEngine.resolveBurstConflicts` — two 8-bit masks, the range plane, and the 5×5 kernel, including the `pixels <= 0` return. `baseMat` is now released after that call, so `divideByWeight` runs with one extra CV_8UC3 still resident. The alignment loop should still be the native peak. ORB / `DescriptorMatcher` are unchanged (finalizer only).
+  - **Gemini:** the Pass 3 open list is unchanged (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite).

@@ -5,11 +5,13 @@ import kotlinx.coroutines.withContext
 import org.opencv.core.Core
 import org.opencv.core.CvType
 import org.opencv.core.Mat
+import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import kotlin.math.roundToInt
 
 /**
  * Geometric polynomial baseline unrolling + cylindrical spine unwrapping + LAB L-channel CLAHE.
@@ -47,7 +49,7 @@ class DewarpFilter(
 
     /**
      * Processes a single raw page file from disk:
-     * 1. Estimates polynomial baseline curvature from horizontal text-line gradient ridges.
+     * 1. Estimates polynomial baseline curvature from the vertical shift of three text strips.
      * 2. Unwraps cylindrical spine foreshortening and baseline warp via [Imgproc.remap].
      * 3. Enhances local contrast on the LAB Luminance channel via CLAHE.
      * 4. Writes the output JPEG directly to [outputFile].
@@ -85,24 +87,22 @@ class DewarpFilter(
      * Fits `δ(u) = a2·u² + a1·u + a0` through three source-image stations so the curve
      * actually interpolates them: spine, mid-page (displacement 0), and outer margin.
      *
-     * The station value is the vertical center of mass of horizontal edges (|Sobel Y|) in the
-     * middle half of the page. A column shift of every text line moves that center of mass by
-     * the same amount, so δ is a displacement in units of image height, not a vertical scale.
-     * Differences are clamped (±4% of page height at the spine, ±2% at the outer edge) so a
-     * single rule or figure cannot throw the page.
+     * Each station is the gray row-profile of a narrow full-height strip. The shift is the
+     * lag from [PageGeometry.verticalShiftPx] against the mid-page strip, so a sag of more
+     * than half a line is not aliased. δ is that lag as a fraction of image height. The spine
+     * station is clamped to ±4% and the outer station to ±2%. A strip with no margin anchor
+     * contributes 0, which leaves that station unwarped.
+     *
+     * Profiles are reduced on the strip ROIs. The full page is never Sobel-filtered.
      */
     fun estimateBaselinePolynomial(srcBgr: Mat, pageSide: PageSide): BaselinePolynomial {
         val gray = Mat()
-        val gradY = Mat()
-        val absGradY = Mat()
+        val rowMeans = Mat()
         try {
             Imgproc.cvtColor(srcBgr, gray, Imgproc.COLOR_BGR2GRAY)
-            Imgproc.Sobel(gray, gradY, CvType.CV_16S, 0, 1, 3)
-            Core.convertScaleAbs(gradY, absGradY)
-
-            val cols = absGradY.cols()
-            val rows = absGradY.rows()
-            if (cols < 32 || rows < 32) {
+            val cols = gray.cols()
+            val rows = gray.rows()
+            if (cols < 32 || rows < 64) {
                 return BaselinePolynomial(a2 = 0f, a1 = 0f, a0 = 0f)
             }
 
@@ -111,40 +111,35 @@ class DewarpFilter(
                 PageGeometry.STATION_MID,
                 PageGeometry.STATION_OUTER
             )
-            val centroidsY = FloatArray(3)
-            val bandTop = (rows * 0.25).toInt()
-            val bandHeight = (rows * 0.50).toInt().coerceAtLeast(1)
-
+            val profiles = Array(sampleU.size) { FloatArray(rows) }
+            val stripWidth = (cols / 30).coerceIn(16, (cols / 6).coerceAtLeast(16))
             for (idx in sampleU.indices) {
-                val u = sampleU[idx]
-                val normX = if (pageSide == PageSide.LEFT) 1f - u else u
-                val stripCenterX = (normX * cols).toInt().coerceIn(8, cols - 9)
-                val stripRect = org.opencv.core.Rect(stripCenterX - 8, bandTop, 16, bandHeight)
-                val strip = absGradY.submat(stripRect)
-                val rowMeans = Mat()
+                val normX = if (pageSide == PageSide.LEFT) 1f - sampleU[idx] else sampleU[idx]
+                val centerX = (normX * (cols - 1)).roundToInt()
+                val x0 = (centerX - stripWidth / 2).coerceIn(0, cols - stripWidth)
+                val strip = gray.submat(Rect(x0, 0, stripWidth, rows))
                 try {
                     Core.reduce(strip, rowMeans, 1, Core.REDUCE_AVG, CvType.CV_32F)
-                    val values = FloatArray(rowMeans.rows())
-                    rowMeans.get(0, 0, values)
-
-                    var weightedSum = 0f
-                    var weightTotal = 1e-5f
-                    for (r in values.indices) {
-                        val w = values[r]
-                        weightedSum += r * w
-                        weightTotal += w
+                    if (rowMeans.get(0, 0, profiles[idx]) < rows) {
+                        profiles[idx].fill(0f)
                     }
-                    centroidsY[idx] = (weightedSum / weightTotal) / bandHeight.toFloat()
                 } finally {
-                    rowMeans.release()
                     strip.release()
                 }
             }
 
-            // Centroid is normalized to the middle band, which is half the page.
-            val bandFraction = bandHeight.toFloat() / rows.toFloat()
-            val dSpine = ((centroidsY[0] - centroidsY[1]) * bandFraction).coerceIn(-0.04f, 0.04f)
-            val dOuter = ((centroidsY[2] - centroidsY[1]) * bandFraction).coerceIn(-0.02f, 0.02f)
+            val maxLag = (rows * PageGeometry.MAX_SHIFT_FRACTION).toInt()
+            val spine = PageGeometry.verticalShiftPx(profiles[1], profiles[0], maxLag)
+            val outer = PageGeometry.verticalShiftPx(profiles[1], profiles[2], maxLag)
+            val rowsF = rows.toFloat()
+            val dSpine = (spine.pixels / rowsF).coerceIn(
+                -PageGeometry.SPINE_STATION_CLAMP,
+                PageGeometry.SPINE_STATION_CLAMP
+            )
+            val dOuter = (outer.pixels / rowsF).coerceIn(
+                -PageGeometry.OUTER_STATION_CLAMP,
+                PageGeometry.OUTER_STATION_CLAMP
+            )
             val quadratic = PageGeometry.fitQuadratic(
                 u0 = sampleU[0],
                 d0 = dSpine,
@@ -160,8 +155,7 @@ class DewarpFilter(
                 spineAngleRad = PageGeometry.SPINE_ANGLE_RAD
             )
         } finally {
-            absGradY.release()
-            gradY.release()
+            rowMeans.release()
             gray.release()
         }
     }
@@ -173,8 +167,7 @@ class DewarpFilter(
      * [PageGeometry.cylindricalImageU], which is compressed toward the spine so the gutter
      * is expanded. Vertical: `mapY = y + δ(u_source) · (height − 1)`. δ is the fitted
      * baseline displacement at the source column being sampled, so a line that sags near the
-     * spine is pulled back. It is not a scale about the page center — the centroid measurement
-     * is a translation, and a scale would move the top and bottom in opposite directions.
+     * spine is pulled back. The lag is a translation of the whole column.
      */
     fun applyCylindricalPolynomialRemap(
         srcBgr: Mat,
@@ -284,6 +277,6 @@ class DewarpFilter(
 
     private companion object {
         /** Hard cap on |δ| so extrapolation past the outer stations cannot shove a line off the page. */
-        const val MAX_DISPLACEMENT = 0.06f
+        const val MAX_DISPLACEMENT = PageGeometry.MAX_SHIFT_FRACTION
     }
 }

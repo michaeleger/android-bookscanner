@@ -32,7 +32,8 @@ import kotlin.math.roundToInt
  * - Releases every OpenCV native [Mat] in explicit `finally` blocks.
  * - Fusion keeps one CV_32FC3 accumulator (the running sum) plus 8-bit weight, darkest-color,
  *   and luminance mats. It does not keep every warped shot resident, so a 4-shot 12MP burst
- *   stays one pipeline instead of four full float frames.
+ *   stays one pipeline instead of four full float frames. The base frame is released after
+ *   [resolveBurstConflicts], before the gutter profile is built.
  */
 class StitcherEngine {
 
@@ -88,12 +89,11 @@ class StitcherEngine {
                 )
             }
 
-            // The base frame is no longer read; free it before the division allocates.
-            baseMat.release()
             divideByWeight(accumulator, weight, fusedBgr)
             accumulator.release()
             weight.release()
-            replaceSpecularWithDarkest(fusedBgr, darkest, minGray, maxGray)
+            resolveBurstConflicts(fusedBgr, baseMat, darkest, minGray, maxGray)
+            baseMat.release()
             darkest.release()
             minGray.release()
             maxGray.release()
@@ -397,36 +397,54 @@ class StitcherEngine {
     }
 
     /**
-     * Min-of-specular: where one shot clipped and another did not, write the darkest valid
-     * color. The weighted mean is kept everywhere else, so stable paper still gets the
-     * noise reduction of the burst. If the "specular" mask covers more than
-     * [MAX_SPECULAR_FRACTION] of the frame, the exposure itself changed and we do not replace.
+     * Separates glare from misregistered text. The per-pixel rule is [PageGeometry.fusionChoice].
+     *
+     * Where one shot sees ink and another sees paper, the mean doubles the glyph and the
+     * darkest color would stamp that ink onto the paper. Those pixels keep [base]. A highlight
+     * is the other case: the darker shot is still paper and the lift is modest. A 5×5 opening
+     * drops thin edge halos that pass the gray test. If the opened mask covers more than
+     * [MAX_SPECULAR_FRACTION] of the frame, the exposure itself changed and the mean is kept.
      */
-    private fun replaceSpecularWithDarkest(
+    private fun resolveBurstConflicts(
         fused: Mat,
+        base: Mat,
         darkest: Mat,
         minGray: Mat,
         maxGray: Mat
     ) {
         val range = Mat()
-        val hot = Mat()
-        val varied = Mat()
-        val specular = Mat()
+        val maskA = Mat()
+        val maskB = Mat()
+        var kernel: Mat? = null
         try {
             Core.subtract(maxGray, minGray, range)
-            Imgproc.threshold(maxGray, hot, SPECULAR_LEVEL, 255.0, Imgproc.THRESH_BINARY)
-            Imgproc.threshold(range, varied, GLARE_MARGIN, 255.0, Imgproc.THRESH_BINARY)
-            Core.bitwise_and(hot, varied, specular)
+
+            Imgproc.threshold(minGray, maskA, PageGeometry.INK_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY_INV)
+            Imgproc.threshold(range, maskB, PageGeometry.MISALIGN_RANGE.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+            Core.bitwise_and(maskA, maskB, maskA)
+            base.copyTo(fused, maskA)
+
+            Imgproc.threshold(maxGray, maskA, PageGeometry.SPECULAR_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+            Imgproc.threshold(minGray, maskB, PageGeometry.PAPER_GRAY.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+            Core.bitwise_and(maskA, maskB, maskA)
+            Imgproc.threshold(range, maskB, PageGeometry.GLARE_RANGE.toDouble(), 255.0, Imgproc.THRESH_BINARY)
+            Core.bitwise_and(maskA, maskB, maskA)
+            Imgproc.threshold(range, maskB, PageGeometry.MAX_GLARE_LIFT.toDouble(), 255.0, Imgproc.THRESH_BINARY_INV)
+            Core.bitwise_and(maskA, maskB, maskA)
+
+            kernel = Imgproc.getStructuringElement(Imgproc.MORPH_ELLIPSE, Size(5.0, 5.0))
+            Imgproc.morphologyEx(maskA, maskB, Imgproc.MORPH_OPEN, kernel)
+
             val pixels = fused.rows() * fused.cols()
             if (pixels <= 0) return
-            val fraction = Core.countNonZero(specular).toDouble() / pixels.toDouble()
+            val fraction = Core.countNonZero(maskB).toDouble() / pixels.toDouble()
             if (fraction > 0.0 && fraction <= MAX_SPECULAR_FRACTION) {
-                darkest.copyTo(fused, specular)
+                darkest.copyTo(fused, maskB)
             }
         } finally {
-            specular.release()
-            varied.release()
-            hot.release()
+            kernel?.release()
+            maskB.release()
+            maskA.release()
             range.release()
         }
     }
@@ -475,12 +493,6 @@ class StitcherEngine {
         const val LOWE_RATIO = 0.75
         const val RANSAC_REPROJ_PX = 4.0
         const val DETECT_LONG_EDGE = 960.0
-
-        /** Near-clipped gray level. White paper usually sits below this; a highlight does not. */
-        const val SPECULAR_LEVEL = 245.0
-
-        /** Min/max luminance gap, in gray levels, required before a hot pixel is called glare. */
-        const val GLARE_MARGIN = 20.0
 
         /** Above this fraction the brightness change is exposure, not a highlight. */
         const val MAX_SPECULAR_FRACTION = 0.35

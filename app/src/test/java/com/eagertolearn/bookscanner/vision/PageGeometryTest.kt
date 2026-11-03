@@ -4,6 +4,9 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import kotlin.math.abs
+import kotlin.math.exp
+import kotlin.math.max
+import kotlin.math.min
 
 class PageGeometryTest {
 
@@ -127,5 +130,123 @@ class PageGeometryTest {
 
         val split = PageGeometry.spineGutter(profile)
         assertEquals(0.51f, split.center / width.toFloat(), 0.02f)
+    }
+
+    @Test
+    fun crossCorrelationTracksShiftPastHalfALinePitch() {
+        val height = 1600
+        val pitch = 47.0
+        val reference = textRowProfile(height, pitch, shift = 0.0)
+        val maxLag = (height * PageGeometry.MAX_SHIFT_FRACTION).toInt()
+        // Half a line is 23.5px. 1% and 3% of this page are 16px and 48px, past the point
+        // where a band centroid wraps. 48px is about one full pitch.
+        val shifts = doubleArrayOf(0.0, 8.0, 16.0, 23.5, 48.0, -24.0, 12.4)
+        for (shift in shifts) {
+            val estimate = PageGeometry.verticalShiftPx(
+                reference,
+                textRowProfile(height, pitch, shift),
+                maxLag
+            )
+            assertEquals("shift $shift px", shift.toFloat(), estimate.pixels, 0.5f)
+            assertTrue("shift $shift confidence ${estimate.confidence}", estimate.confidence >= 0.30f)
+        }
+
+        val gained = textRowProfile(height, pitch, shift = 48.0).map { it * 0.7f + 30f }.toFloatArray()
+        val gainEstimate = PageGeometry.verticalShiftPx(reference, gained, maxLag)
+        assertEquals(48f, gainEstimate.pixels, 0.5f)
+    }
+
+    @Test
+    fun unanchoredOrFlatProfilesAreNotShifted() {
+        val flat = PageGeometry.verticalShiftPx(FloatArray(400) { 128f }, FloatArray(400) { 140f }, 24)
+        assertEquals(0f, flat.pixels, 0f)
+
+        val height = 800
+        val pitch = 47.0
+        val reference = textRowProfile(height, pitch, shift = 0.0, marginFrac = 0.0)
+        val moving = textRowProfile(height, pitch, shift = 0.03 * height, marginFrac = 0.0)
+        val bleed = PageGeometry.verticalShiftPx(reference, moving, (height * 0.06f).toInt())
+        assertEquals(0f, bleed.pixels, 0f)
+    }
+
+    @Test
+    fun wideGutterShadowStaysOffCenter() {
+        val width = 4000
+        for (sigmaFrac in floatArrayOf(0.03f, 0.05f)) {
+            for (depth in floatArrayOf(20f, 30f)) {
+                val profile = gaussianValley(width, centerFrac = 0.52f, sigmaFrac = sigmaFrac, depth = depth)
+                val split = PageGeometry.spineGutter(profile)
+                assertEquals(
+                    "sigma=$sigmaFrac depth=$depth",
+                    0.52f,
+                    split.center / width.toFloat(),
+                    0.01f
+                )
+                assertTrue(split.leftEdge < split.center)
+                assertTrue(split.rightEdge > split.center)
+            }
+        }
+    }
+
+    @Test
+    fun misalignedInkKeepsTheBaseShot() {
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(40f, 250f))
+        assertEquals(PageGeometry.FusionChoice.BASE, PageGeometry.fusionChoice(100f, 250f))
+    }
+
+    @Test
+    fun glareOnPaperSelectsTheDarkestShot() {
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(210f, 255f))
+        assertEquals(PageGeometry.FusionChoice.DARKEST, PageGeometry.fusionChoice(190f, 250f))
+    }
+
+    @Test
+    fun agreeingPixelsKeepTheMean() {
+        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(180f, 200f))
+        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(30f, 45f))
+        // Cream paper under a hard clip is left as the mean: the darker value is not ink,
+        // and it is not bright enough to call a highlight.
+        assertEquals(PageGeometry.FusionChoice.MEAN, PageGeometry.fusionChoice(160f, 255f))
+    }
+
+    private fun textRowProfile(
+        height: Int,
+        pitch: Double,
+        shift: Double,
+        marginFrac: Double = 0.12,
+        lineSigma: Double = 1.8,
+        paper: Double = 200.0,
+        ink: Double = 40.0
+    ): FloatArray {
+        val out = FloatArray(height) { paper.toFloat() }
+        val top = height * marginFrac + shift
+        val bottom = height - height * marginFrac + shift
+        var line = top + pitch * 0.5
+        while (line < bottom) {
+            val y0 = max(0, (line - 4.0 * lineSigma).toInt())
+            val y1 = min(height, (line + 4.0 * lineSigma).toInt() + 1)
+            for (row in y0 until y1) {
+                val delta = (row - line) / lineSigma
+                val weight = exp(-0.5 * delta * delta)
+                out[row] = (out[row] - (paper - ink) * weight).toFloat()
+            }
+            line += pitch
+        }
+        return out
+    }
+
+    private fun gaussianValley(
+        width: Int,
+        centerFrac: Float,
+        sigmaFrac: Float,
+        depth: Float,
+        page: Float = 200f
+    ): FloatArray {
+        val center = centerFrac * width
+        val sigma = sigmaFrac * width
+        return FloatArray(width) { column ->
+            val delta = (column - center) / sigma
+            page - depth * exp(-0.5 * delta * delta).toFloat()
+        }
     }
 }

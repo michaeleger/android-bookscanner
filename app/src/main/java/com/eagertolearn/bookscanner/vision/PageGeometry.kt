@@ -1,15 +1,18 @@
 package com.eagertolearn.bookscanner.vision
 
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * Pure page-geometry used by [DewarpFilter] and [StitcherEngine].
  *
- * Kept free of OpenCV so the station fit, the cylindrical source coordinate, and the gutter
- * valley score can be checked without a device or native libs.
+ * Kept free of OpenCV so the station fit, the cylindrical source coordinate, the baseline
+ * shift, and the gutter valley score can be checked without a device or native libs.
  */
 internal object PageGeometry {
 
@@ -30,8 +33,36 @@ internal object PageGeometry {
     const val STATION_MID = 0.50f
     const val STATION_OUTER = 0.90f
 
+    /**
+     * Largest vertical shift the correlator will search for, as a fraction of page height.
+     * The remap applies the same cap. Station clamps are tighter (see DewarpFilter).
+     */
+    const val MAX_SHIFT_FRACTION = 0.06f
+
+    /** Spine-station clamp, fraction of page height. Real gutter sag of 1–3% sits inside this. */
+    const val SPINE_STATION_CLAMP = 0.04f
+
+    /** Outer-station clamp, fraction of page height. */
+    const val OUTER_STATION_CLAMP = 0.02f
+
     /** Gray levels. Below this the search band has no gutter and the split stays at center. */
     const val MIN_GUTTER_PROMINENCE = 12f
+
+    /**
+     * Per-pixel fusion rule. OpenCV `THRESH_BINARY` is strict `>`, and `THRESH_BINARY_INV`
+     * is `<=`, so the comparisons here match the masks in `StitcherEngine`.
+     *
+     * Glare is a modest lift that stays on paper: the darker shot is still above [PAPER_GRAY]
+     * and the gap is at most [MAX_GLARE_LIFT]. Ink against near-white paper has a much larger
+     * gap and a dark minimum; that is misalignment, and the base shot is kept. Anything else
+     * keeps the weighted mean.
+     */
+    const val SPECULAR_GRAY = 245f
+    const val PAPER_GRAY = 180f
+    const val GLARE_RANGE = 20f
+    const val MAX_GLARE_LIFT = 90f
+    const val INK_GRAY = 140f
+    const val MISALIGN_RANGE = 30f
 
     /**
      * Vertical baseline displacement as a fraction of image height:
@@ -51,6 +82,27 @@ internal object PageGeometry {
         val leftEdge: Int,
         val rightEdge: Int
     )
+
+    /**
+     * Vertical shift of a strip relative to a reference strip, in pixels.
+     * Positive means the moving strip's text sits lower (larger row index).
+     * [confidence] is the fine normalized correlation, or 0 when the shift was rejected.
+     */
+    data class ShiftEstimate(
+        val pixels: Float,
+        val confidence: Float
+    )
+
+    enum class FusionChoice {
+        /** Shots agree, or the disagreement is too mild to call. */
+        MEAN,
+
+        /** Highlight on paper: write the darkest shot. */
+        DARKEST,
+
+        /** Ink in one shot and paper in another: keep the reference shot. */
+        BASE
+    }
 
     /**
      * Exact quadratic through the three stations. [u] is spine distance, [d] is the
@@ -116,17 +168,113 @@ internal object PageGeometry {
     }
 
     /**
+     * How far [moving] is shifted relative to [reference], in pixels.
+     *
+     * The centroid of a periodic line profile aliases at half a line pitch, so a real sag of
+     * one or two pitches comes back near zero or with the wrong sign. This correlates the
+     * text-block envelopes first (the top and bottom margins are not periodic), then refines
+     * inside half a pitch so the ±pitch sidelobes cannot win. A full-bleed strip with no
+     * margin anchor, a flat strip, or an ambiguous peak returns 0 rather than a wrapped shift.
+     *
+     * Positive pixels mean features in [moving] lie below the same features in [reference].
+     */
+    fun verticalShiftPx(
+        reference: FloatArray,
+        moving: FloatArray,
+        maxLag: Int
+    ): ShiftEstimate {
+        val length = min(reference.size, moving.size)
+        if (length < 32 || maxLag < 1) return ShiftEstimate(0f, 0f)
+        val ref = if (reference.size == length) reference else reference.copyOf(length)
+        val mov = if (moving.size == length) moving else moving.copyOf(length)
+
+        val pitch = linePitchPx(ref, length)
+        if (pitch < 0) return ShiftEstimate(0f, 0f)
+
+        val envelopeSigma = 0.85f * pitch
+        val envRef = gaussianSmooth(ref, envelopeSigma)
+        val envMov = gaussianSmooth(mov, envelopeSigma)
+        if (!hasTextBlockAnchor(ref, envRef)) return ShiftEstimate(0f, 0f)
+
+        val lagLimit = min(maxLag, length / 3)
+        if (lagLimit < 1) return ShiftEstimate(0f, 0f)
+        val scores = FloatArray(2 * lagLimit + 1)
+        var bestLag = 0
+        var best = Float.NEGATIVE_INFINITY
+        for (lag in -lagLimit..lagLimit) {
+            val score = normalizedCorrelation(envRef, envMov, lag, length)
+            scores[lag + lagLimit] = score
+            if (score > best) {
+                best = score
+                bestLag = lag
+            }
+        }
+        if (abs(bestLag) == lagLimit || best < MIN_COARSE_NCC) return ShiftEstimate(0f, 0f)
+
+        var second = Float.NEGATIVE_INFINITY
+        for (lag in -lagLimit..lagLimit) {
+            if (abs(lag - bestLag) <= pitch) continue
+            val score = scores[lag + lagLimit]
+            if (score > second) second = score
+        }
+        if (second > Float.NEGATIVE_INFINITY && best - second < MIN_COARSE_MARGIN) {
+            return ShiftEstimate(0f, 0f)
+        }
+
+        val centerIndex = bestLag + lagLimit
+        val coarse = bestLag + parabolicDelta(
+            left = scores[centerIndex - 1],
+            center = best,
+            right = scores[centerIndex + 1]
+        )
+
+        val highPassSigma = 2f * pitch
+        val highRef = subtractSmooth(ref, highPassSigma)
+        val highMov = subtractSmooth(mov, highPassSigma)
+        val halfPitch = max(2, (0.45f * pitch).toInt())
+        val fineCenter = coarse.roundToInt()
+        var fineLag = fineCenter
+        var fineBest = Float.NEGATIVE_INFINITY
+        val fineScores = HashMap<Int, Float>(halfPitch * 2 + 1)
+        for (lag in (fineCenter - halfPitch)..(fineCenter + halfPitch)) {
+            if (lag < -lagLimit || lag > lagLimit) continue
+            val score = normalizedCorrelation(highRef, highMov, lag, length)
+            fineScores[lag] = score
+            if (score > fineBest) {
+                fineBest = score
+                fineLag = lag
+            }
+        }
+        if (fineBest < MIN_FINE_NCC) return ShiftEstimate(0f, 0f)
+        val pixels = fineLag + parabolicDelta(
+            left = fineScores[fineLag - 1] ?: fineBest,
+            center = fineBest,
+            right = fineScores[fineLag + 1] ?: fineBest
+        )
+        return ShiftEstimate(pixels, fineBest)
+    }
+
+    fun fusionChoice(minGray: Float, maxGray: Float): FusionChoice {
+        val range = maxGray - minGray
+        val glare = maxGray > SPECULAR_GRAY &&
+            minGray > PAPER_GRAY &&
+            range > GLARE_RANGE &&
+            range <= MAX_GLARE_LIFT
+        if (glare) return FusionChoice.DARKEST
+        if (minGray <= INK_GRAY && range > MISALIGN_RANGE) return FusionChoice.BASE
+        return FusionChoice.MEAN
+    }
+
+    /**
      * Spine column from a full-width luminance profile (column means).
      *
-     * The gutter is a narrow valley: dark, with bright page on both shoulders, and only a few
-     * percent of the spread wide. The darkest column is not that — a figure, a rule, or a
-     * black border inside the 35–65% band often is darker than the gutter shadow.
-     *
-     * Score at each local minimum is shoulder prominence after a light box smooth. Reject dips
-     * shallower than [MIN_GUTTER_PROMINENCE], narrower than 0.4% of the width (rules), or wider
-     * than 6% (a dark illustration). The split excludes the half-depth core of the winning
-     * valley so the shadow is not left on either page. A flat or ambiguous profile stays at
-     * the center with no inset.
+     * The gutter is a valley with page on both shoulders. A thin rule and a narrow dark
+     * column are rejected by width. A flat dark figure is rejected when it is wider than 6%
+     * of the spread, because its floor occupies the whole run. A thick-book shadow is wider
+     * than that and still curved, so shoulders are read by walking uphill until the slope
+     * flattens (up to 12% of the width on each side) and the valley may be as wide as 16%.
+     * The split excludes the half-depth core, capped at 8% of the width on each side.
+     * A flat or ambiguous profile stays at the center with no inset.
      */
     fun spineGutter(profile: FloatArray): GutterSplit {
         val width = profile.size
@@ -135,14 +283,15 @@ internal object PageGeometry {
             return GutterSplit(mid, mid, mid)
         }
 
-        val smoothR = max(2, width / 400)
-        val shoulder = max(8, width / 40)
-        val smooth = boxSmooth(profile, smoothR)
+        val smooth = boxSmooth(profile, max(2, width / 400))
         val start = (width * 0.35f).toInt().coerceIn(1, width - 2)
         val end = (width * 0.65f).toInt().coerceIn(start + 1, width - 1)
         val minWidth = max(8, (width * 0.004f).toInt())
-        val maxWidth = max(minWidth, (width * 0.06f).toInt())
+        val maxNarrow = max(minWidth, (width * 0.06f).toInt())
+        val maxWide = max(maxNarrow, (width * 0.16f).toInt())
+        val sideLimit = (width * 0.12f).toInt().coerceAtLeast(1)
         val pageCenter = width / 2f
+        val insetCap = (width * 0.08f).toInt()
 
         var bestScore = Float.NEGATIVE_INFINITY
         var bestMid = width / 2
@@ -150,35 +299,40 @@ internal object PageGeometry {
         var bestRight = bestMid
 
         var x = start
-        while (x < end) {
+        while (x < end - 1) {
             val isMin = smooth[x] <= smooth[x - 1] && smooth[x] <= smooth[x + 1]
             if (!isMin) {
                 x++
                 continue
             }
-            // Group only the flat floor. A darker column is a different dip, and the
-            // surrounding page is a different (usually worthless) local minimum.
             var right = x
             while (right + 1 < end && abs(smooth[right + 1] - smooth[x]) <= 1f) {
                 right++
             }
-            val mid = (x + right) / 2
-            val leftShoulder = maxIn(smooth, mid - shoulder, mid)
-            val rightShoulder = maxIn(smooth, mid + 1, mid + 1 + shoulder)
-            val prominence = min(leftShoulder, rightShoulder) - smooth[mid]
+            var floorIndex = x
+            for (i in x..right) {
+                if (profile[i] < profile[floorIndex]) floorIndex = i
+            }
+            val leftShoulder = shoulderIndex(smooth, floorIndex, -1, sideLimit)
+            val rightShoulder = shoulderIndex(smooth, floorIndex, 1, sideLimit)
+            val prominence = min(smooth[leftShoulder], smooth[rightShoulder]) - smooth[floorIndex]
             if (prominence >= MIN_GUTTER_PROMINENCE) {
-                val run = halfDepthRun(profile, mid, prominence)
+                val run = halfDepthRun(profile, floorIndex, prominence)
                 val valleyWidth = run.second - run.first + 1
-                if (valleyWidth in minWidth..maxWidth) {
-                    val runMid = (run.first + run.second) / 2
-                    val penalty = 3f * abs(runMid - pageCenter) / (width * 0.15f)
-                    val score = prominence - penalty
-                    if (score > bestScore) {
-                        bestScore = score
-                        bestMid = runMid
-                        val cap = (width * 0.03f).toInt()
-                        bestLeft = max(runMid - cap, run.first)
-                        bestRight = min(runMid + cap, run.second)
+                if (valleyWidth in minWidth..maxWide) {
+                    val floorFraction = fractionNearFloor(profile, run.first, run.second, profile[floorIndex], prominence)
+                    val wide = valleyWidth > maxNarrow
+                    val plateau = floorFraction > MAX_FLOOR_FRACTION
+                    if (!(wide && plateau)) {
+                        val runMid = (run.first + run.second) / 2
+                        val penalty = 3f * abs(runMid - pageCenter) / (width * 0.15f)
+                        val score = prominence - penalty
+                        if (score > bestScore) {
+                            bestScore = score
+                            bestMid = runMid
+                            bestLeft = max(runMid - insetCap, run.first)
+                            bestRight = min(runMid + insetCap, run.second)
+                        }
                     }
                 }
             }
@@ -192,6 +346,164 @@ internal object PageGeometry {
         val leftEdge = bestLeft.coerceIn(1, width - 2)
         val rightEdge = bestRight.coerceIn(leftEdge, width - 1)
         return GutterSplit(bestMid.coerceIn(leftEdge, rightEdge), leftEdge, rightEdge)
+    }
+
+    private fun linePitchPx(profile: FloatArray, length: Int): Int {
+        val maxLag = min(length / 3, max(12, (length * 0.10f).toInt()))
+        if (maxLag <= 8) return -1
+        var prev = normalizedCorrelation(profile, profile, 6, length)
+        var currentLag = 7
+        var current = normalizedCorrelation(profile, profile, currentLag, length)
+        var lag = 8
+        while (lag <= maxLag) {
+            val next = normalizedCorrelation(profile, profile, lag, length)
+            if (current >= prev && current >= next && current > MIN_PITCH_NCC) {
+                return currentLag
+            }
+            prev = current
+            current = next
+            currentLag = lag
+            lag++
+        }
+        return -1
+    }
+
+    /**
+     * Margins make the smoothed text block darker than the page above and below it.
+     * A full-bleed periodic strip has a flat envelope, and correlating it aliases at the pitch.
+     */
+    private fun hasTextBlockAnchor(raw: FloatArray, envelope: FloatArray): Boolean {
+        val rawRange = centralRange(raw)
+        val envelopeRange = centralRange(envelope)
+        if (envelopeRange < MIN_ENVELOPE_RANGE) return false
+        if (rawRange <= 1f) return false
+        return envelopeRange >= MIN_ENVELOPE_FRACTION * rawRange
+    }
+
+    private fun centralRange(values: FloatArray): Float {
+        val from = (values.size * 0.08f).toInt()
+        val until = (values.size * 0.92f).toInt().coerceAtLeast(from + 1).coerceAtMost(values.size)
+        var low = Float.POSITIVE_INFINITY
+        var high = Float.NEGATIVE_INFINITY
+        for (i in from until until) {
+            val value = values[i]
+            if (value < low) low = value
+            if (value > high) high = value
+        }
+        if (high < low) return 0f
+        return high - low
+    }
+
+    private fun subtractSmooth(values: FloatArray, sigma: Float): FloatArray {
+        val trend = gaussianSmooth(values, sigma)
+        return FloatArray(values.size) { i -> values[i] - trend[i] }
+    }
+
+    private fun gaussianSmooth(values: FloatArray, sigma: Float): FloatArray {
+        if (sigma < 0.6f) return values.copyOf()
+        val radius = min(values.size / 2, max(1, (3f * sigma).roundToInt()))
+        val kernel = FloatArray(radius * 2 + 1)
+        val inv = 1.0 / (2.0 * sigma * sigma)
+        var weight = 0.0
+        for (i in kernel.indices) {
+            val x = (i - radius).toDouble()
+            val w = exp(-x * x * inv)
+            kernel[i] = w.toFloat()
+            weight += w
+        }
+        val norm = 1.0 / weight
+        for (i in kernel.indices) {
+            kernel[i] = (kernel[i] * norm).toFloat()
+        }
+        val n = values.size
+        val out = FloatArray(n)
+        for (i in 0 until n) {
+            var acc = 0.0
+            val base = i - radius
+            for (k in kernel.indices) {
+                var j = base + k
+                if (j < 0) j = 0 else if (j >= n) j = n - 1
+                acc += values[j] * kernel[k]
+            }
+            out[i] = acc.toFloat()
+        }
+        return out
+    }
+
+    /** Normalized cross-correlation of [a] against [b] shifted by [lag], on the overlap only. */
+    private fun normalizedCorrelation(a: FloatArray, b: FloatArray, lag: Int, length: Int): Float {
+        val i0 = max(0, -lag)
+        val i1 = min(length, length - lag)
+        val count = i1 - i0
+        if (count < 8) return 0f
+        var meanA = 0.0
+        var meanB = 0.0
+        for (i in i0 until i1) {
+            meanA += a[i]
+            meanB += b[i + lag]
+        }
+        meanA /= count
+        meanB /= count
+        var numerator = 0.0
+        var denA = 0.0
+        var denB = 0.0
+        for (i in i0 until i1) {
+            val da = a[i] - meanA
+            val db = b[i + lag] - meanB
+            numerator += da * db
+            denA += da * da
+            denB += db * db
+        }
+        val den = sqrt(denA * denB)
+        if (den < 1e-8) return 0f
+        return (numerator / den).toFloat()
+    }
+
+    private fun parabolicDelta(left: Float, center: Float, right: Float): Float {
+        val denom = left - 2f * center + right
+        if (abs(denom) < 1e-6f) return 0f
+        return (0.5f * (left - right) / denom).coerceIn(-0.5f, 0.5f)
+    }
+
+    /**
+     * Walk uphill from a valley floor. Stops at a new dip, at [limit], or once the slope
+     * has flattened. The value at the stop is the shoulder used for prominence.
+     */
+    private fun shoulderIndex(smooth: FloatArray, start: Int, step: Int, limit: Int): Int {
+        var x = start
+        val floor = smooth[start]
+        val hold = max(6, limit / 25)
+        val last = smooth.lastIndex
+        while (abs(x - start) < limit) {
+            val next = x + step
+            if (next < 0 || next > last) break
+            if (smooth[next] < smooth[x] - 1.5f) break
+            val risen = smooth[x] - floor
+            val ahead = x + step * hold
+            if (ahead in 0..last && risen > 4f) {
+                val aheadRise = smooth[ahead] - smooth[x]
+                if (aheadRise < max(0.5f, 0.08f * risen)) break
+            }
+            x = next
+        }
+        return x
+    }
+
+    private fun fractionNearFloor(
+        profile: FloatArray,
+        left: Int,
+        right: Int,
+        floor: Float,
+        prominence: Float
+    ): Float {
+        val level = floor + 0.20f * prominence
+        var count = 0
+        for (i in left..right) {
+            if (profile[i] <= level) count++
+        }
+        val span = right - left + 1
+        if (span <= 0) return 1f
+        return count.toFloat() / span.toFloat()
     }
 
     private fun boxSmooth(profile: FloatArray, radius: Int): FloatArray {
@@ -209,17 +521,6 @@ internal object PageGeometry {
         return out
     }
 
-    private fun maxIn(values: FloatArray, from: Int, until: Int): Float {
-        val a = from.coerceAtLeast(0)
-        val b = until.coerceAtMost(values.size)
-        if (b <= a) return values[a.coerceIn(0, values.lastIndex)]
-        var peak = Float.NEGATIVE_INFINITY
-        for (i in a until b) {
-            if (values[i] > peak) peak = values[i]
-        }
-        return peak
-    }
-
     /** Inclusive column run around [x] that stays within half of [prominence] of the floor. */
     private fun halfDepthRun(profile: FloatArray, x: Int, prominence: Float): Pair<Int, Int> {
         val level = profile[x] + 0.5f * prominence
@@ -230,4 +531,14 @@ internal object PageGeometry {
         while (right < last && profile[right + 1] <= level) right++
         return left to right
     }
+
+    private const val MIN_PITCH_NCC = 0.25f
+    private const val MIN_COARSE_NCC = 0.25f
+    private const val MIN_COARSE_MARGIN = 0.05f
+    private const val MIN_FINE_NCC = 0.30f
+    private const val MIN_ENVELOPE_RANGE = 4f
+    private const val MIN_ENVELOPE_FRACTION = 0.04f
+
+    /** Wide runs flatter than this are figures, not gutter shadows. */
+    private const val MAX_FLOOR_FRACTION = 0.75f
 }
