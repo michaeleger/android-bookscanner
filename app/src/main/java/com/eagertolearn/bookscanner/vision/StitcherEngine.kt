@@ -33,7 +33,9 @@ import kotlin.math.roundToInt
  * - Fusion keeps one CV_32FC3 accumulator (the running sum) plus 8-bit weight, darkest-color,
  *   and luminance mats. It does not keep every warped shot resident, so a 4-shot 12MP burst
  *   stays one pipeline instead of four full float frames. The base frame is released after
- *   [resolveBurstConflicts], before the gutter profile is built.
+ *   [resolveBurstConflicts], before the gutter profile is built. The native peak is the
+ *   warp in the alignment loop (~350MB at 12MP). The division runs in row strips so it stays
+ *   below that even with the base frame resident.
  */
 class StitcherEngine {
 
@@ -229,6 +231,8 @@ class StitcherEngine {
         try {
             Imgproc.cvtColor(candidateBgr, candidateGray, Imgproc.COLOR_BGR2GRAY)
             Imgproc.resize(candidateGray, candidateSmall, baseSmallSize, 0.0, 0.0, Imgproc.INTER_AREA)
+            // Full-res gray is not read again; free it before the warp, which is the stitch peak.
+            candidateGray.release()
             orb.detectAndCompute(candidateSmall, noMask, candidateKeypoints, candidateDescriptors)
             if (candidateDescriptors.empty()) return false
 
@@ -367,31 +371,43 @@ class StitcherEngine {
     }
 
     /**
-     * One float plane at a time: extract, divide, narrow to 8-bit, release. A full split plus
-     * a float merge would hold three extra CV_32FC1 planes and a second CV_32FC3 frame
-     * (~290MB at 12MP) on top of the accumulator.
+     * Divides the accumulator by the per-pixel weight in row strips of [DIVIDE_STRIP_ROWS],
+     * in place, and narrows each strip straight into [dst8]. The base frame is still resident
+     * here (it is read by [resolveBurstConflicts]), so full-frame temporaries are not affordable:
+     * a full-frame CV_32FC1 weight plus one CV_32FC1 plane plus three 8-bit planes put this
+     * step at ~384MB native at 12MP, above the alignment loop. Strip temporaries are ~16MB.
+     *
+     * The accumulator is consumed (overwritten with the mean) and must not be reused.
      */
     private fun divideByWeight(accumulator: Mat, weight: Mat, dst8: Mat) {
+        val rows = accumulator.rows()
+        val cols = accumulator.cols()
+        dst8.create(rows, cols, CvType.CV_8UC3)
         val weight32 = Mat()
-        val plane32 = Mat()
-        val planes8 = ArrayList<Mat>(3)
+        val weight3 = Mat()
         try {
-            weight.convertTo(weight32, CvType.CV_32FC1)
-            for (c in 0 until accumulator.channels()) {
-                Core.extractChannel(accumulator, plane32, c)
-                Core.divide(plane32, weight32, plane32)
-                val plane8 = Mat()
-                planes8.add(plane8)
-                plane32.convertTo(plane8, CvType.CV_8UC1)
+            var y = 0
+            while (y < rows) {
+                val stripRows = min(DIVIDE_STRIP_ROWS, rows - y)
+                val roi = Rect(0, y, cols, stripRows)
+                val accStrip = accumulator.submat(roi)
+                val weightStrip = weight.submat(roi)
+                val dstStrip = dst8.submat(roi)
+                try {
+                    weightStrip.convertTo(weight32, CvType.CV_32FC1)
+                    Core.merge(listOf(weight32, weight32, weight32), weight3)
+                    Core.divide(accStrip, weight3, accStrip)
+                    // dstStrip already has this size and type, so convertTo writes into dst8.
+                    accStrip.convertTo(dstStrip, CvType.CV_8UC3)
+                } finally {
+                    dstStrip.release()
+                    weightStrip.release()
+                    accStrip.release()
+                }
+                y += stripRows
             }
-            plane32.release()
-            weight32.release()
-            Core.merge(planes8, dst8)
         } finally {
-            for (plane in planes8) {
-                plane.release()
-            }
-            plane32.release()
+            weight3.release()
             weight32.release()
         }
     }
@@ -493,6 +509,9 @@ class StitcherEngine {
         const val LOWE_RATIO = 0.75
         const val RANSAC_REPROJ_PX = 4.0
         const val DETECT_LONG_EDGE = 960.0
+
+        /** Rows per [divideByWeight] strip: ~12MB of CV_32FC3 temporaries at a 4000px width. */
+        const val DIVIDE_STRIP_ROWS = 256
 
         /** Above this fraction the brightness change is exposure, not a highlight. */
         const val MAX_SPECULAR_FRACTION = 0.35

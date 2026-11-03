@@ -158,3 +158,20 @@
 * **Target for Next Agent:**
   - **Claude (Auditor):** `StitcherEngine.resolveBurstConflicts` — two 8-bit masks, the range plane, and the 5×5 kernel, including the `pixels <= 0` return. `baseMat` is now released after that call, so `divideByWeight` runs with one extra CV_8UC3 still resident. The alignment loop should still be the native peak. ORB / `DescriptorMatcher` are unchanged (finalizer only).
   - **Gemini:** the Pass 3 open list is unchanged (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite).
+
+---
+
+## Pass 6 — Claude (re-audit of Grok Pass 5)
+* **Last Updated:** 2026-11-03 02:50 EST | Claude (Auditor & Safety Guard)
+* **Build:** `testDebugUnitTest` (15/15), `assembleDebug`, `lintDebug` (0 errors) → **BUILD SUCCESSFUL**. Still not run on a device or on a real page image.
+* **Mat lifetimes in `resolveBurstConflicts`: clean.** `range`, `maskA`, `maskB`, and the 5×5 kernel are released on every path, including the `pixels <= 0` return. The BASE and DARKEST masks cannot overlap: BASE needs min ≤ 140 and DARKEST needs min > 180, and the opening only removes pixels. So applying BASE first matches `PageGeometry.fusionChoice`.
+* **Fixed:**
+  - **Native peak moved to `divideByWeight`.** Pass 5 keeps `baseMat` resident through the division. At 12MP, the persistent set (accumulator 144 + weight 12 + darkest 36 + min/max gray 24 + base 36 ≈ 252MB) plus the full-frame CV_32FC1 weight (48), the CV_32FC1 plane (48), and three 8-bit planes (36) peaked at **~384MB**, above the alignment loop. The division now runs in place in 256-row strips and writes straight into a preallocated `fusedBgr`. Strip temporaries are ~16MB, so this step is ~304MB. The accumulator is consumed and released right after, as before.
+  - `alignToBase`: the full-res `candidateGray` is released right after the downscale instead of being held through both `warpPerspective` calls. The alignment-loop peak drops from ~360MB to **~348MB**, and that loop is the stitch peak again.
+* **Math finding for Grok (checked against the code, not changed):**
+  - **Glare over ink falls to BASE.** If glare washes out text in one shot, that pixel has min ≈ ink (≤ 140) and max ≥ 245. `fusionChoice` returns BASE (misalignment), not DARKEST. When the base shot (`shotFiles.first()`) is the glared one, the glare is kept over the text, and that is the case the burst exists to fix. `fusionChoice(40f, 250f) == BASE`. A possible split: if the base pixel itself is ≥ `SPECULAR_GRAY`, the base is the clipped shot, so take the darkest (or the mean of the unclipped shots) instead of base. That needs a base-gray plane in `resolveBurstConflicts` (+12MB at 12MP, still below the peak). Add a `PageGeometryTest` case.
+  - Minor: `DewarpFilter.estimateBaselinePolynomial` checks `rowMeans.get(...) < rows`, but the OpenCV Java `get` returns **bytes** copied, not elements. A partial copy of more than rows/4 floats passes. This can't happen with a `rows×1` reduce output, so it is harmless, but the check should be `< rows * 4` or be removed.
+* **Modified Files:** `vision/StitcherEngine.kt`, `HANDOFF.md`.
+* **Target for Next Agent:**
+  - **Grok:** glare-over-ink in `fusionChoice` / `resolveBurstConflicts` (above). If you add a base-gray plane, release it in the same `finally`. Keep `divideByWeight` strip-wise. A full-frame float temporary there pushes the peak above the alignment loop again.
+  - **Gemini:** the Pass 3 open list is unchanged (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite).
