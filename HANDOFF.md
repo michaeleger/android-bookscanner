@@ -88,3 +88,50 @@
 * **Target for Next Agent (additions to Pass 2 list):**
   - **Grok:** `DewarpFilter.estimateBaselinePolynomial`: the quadratic is evaluated in s=1-u but a2=(dS+dO)/2, a1=dO-dS don't interpolate the stations (P(0.5) ≠ 0), and the offset is applied as a radial *scale* `normY*(1+offset*normY)` rather than a baseline displacement. `applyCylindricalPolynomialRemap`: per-pixel Kotlin loop recomputes `pow` per row. Precompute per column and build the maps with Core ops. `StitcherEngine`: black `warpPerspective` borders are accumulated, yet every pixel is divided by `fusedCount` (needs a per-pixel weight mask).
   - **Gemini / architecture:** each spread append loads and rewrites the whole volume (O(n²) I/O over a volume, plus a transient second copy that counts against the storage budget). Consider per-spread PDFs merged at volume close. The Pass 2 "orphaned partial-spread shots" item is resolved.
+
+---
+
+## Pass 3 — Grok (Math & Computer Vision)
+* **Last Updated:** 2026-11-03 02:04 EST | Grok (Math & Computer Vision Specialist)
+* **Build:** `testDebugUnitTest` → 9 tests, all passing (`PageGeometryTest`). `assembleDebug` → **BUILD SUCCESSFUL**. Geometry was checked on synthetic profiles (valley vs dark figure, rule, flat page). Remap and fusion have not been run on a real page image (no device, no host OpenCV).
+* **Review findings, now fixed:**
+  - **Baseline polynomial.** `a2 = (dS+dO)/2`, `a1 = dO-dS` does not pass through the three stations, and `P(0.5) ≠ 0`. The curve was also evaluated at `s = 1-u`, so the spine station and the outer station were swapped. `estimateBaselinePolynomial` now solves the Vandermonde system in spine distance `u` (`0` at the spine). δ is a fraction of image height: centroid shift inside the middle band, times `bandHeight/rows`, clamped to ±4% (spine) and ±2% (outer edge).
+  - **mapY.** The centroid is a vertical translation of the text. It was applied as `normY * (1 + offset * normY)`, a scale about the page center, which moves the top and bottom in opposite directions. `mapY = y + δ(u_source) · (height − 1)`, clamped to ±6% of height. Column source-X and δ are computed once; `mapX`/`mapY` are built with `Core.repeat` plus a per-row scalar add (no per-pixel `pow`).
+  - **Cylindrical mapX.** `u - 0.14*(1-cos(…))` had `d(source)/d(dest) > 1` at the spine, so the gutter was compressed. Source position is now the orthographic integral `∫ cos θ ds` over the inner 25% of the page, normalized so both edges stay fixed. Spine tilt is 0.521 rad (~29.8°), which expands the gutter by 1.14× (the old 0.14 factor, with the sign corrected). `α = 0` is the identity.
+  - **Fusion.** Black `warpPerspective` borders were divided by `fusedCount`. Each shot now carries a nearest-neighbor coverage mask (eroded 1px) and `Imgproc.accumulate` uses it. The result is divided by a per-pixel weight. Glare is min-of-specular: a pixel that reaches gray 245 in one shot and is ≥20 levels darker in another is replaced with the darkest in-mask color, unless that mask covers more than 35% of the frame (exposure change, leave the mean). Full-frame median was skipped so a 4-shot 12MP burst does not keep four resident images.
+  - **ORB.** Detect and match on a long edge of 960px. Points are scaled back to full resolution before RANSAC (4px threshold stays in full-res pixels), with Lowe's ratio, an inlier count, and a plausibility check (scale, translation, perspective) so a bad match is dropped and the base shot stands.
+  - **Gutter.** Darkest column in the 35–65% band loses to rules, figures, and wide black regions. `PageGeometry.spineGutter` scores shoulder prominence of a narrow valley (0.4%–6% of width, at least 12 gray levels) on the central 70% of rows. The half-depth core of the valley is left out of both pages. A flat or ambiguous profile stays at the center with no inset.
+* **Assumptions (correct these if the books disagree):**
+  - Spine angle is a constant 29.8°, not estimated from the photo. Flatter books will be slightly over-stretched at the gutter; tighter gutters will be under-stretched.
+  - Baseline curl is one shift per column. The three-station centroid cannot see a curl that changes with row.
+  - Specular test is saturation plus cross-shot range, not a learned highlight detector.
+* **Modified Files:**
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/PageGeometry.kt` (new)
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/DewarpFilter.kt`
+  - `app/src/main/java/com/eagertolearn/bookscanner/vision/StitcherEngine.kt`
+  - `app/src/test/java/com/eagertolearn/bookscanner/vision/PageGeometryTest.kt` (new)
+  - `app/build.gradle.kts`
+  - `gradle/libs.versions.toml`
+  - `HANDOFF.md`
+* **Target for Next Agent:**
+  - **Claude (Auditor):** Re-audit native `Mat` lifetimes in the new fusion path (`StitcherEngine.accumulateAlignedShots`, coverage mask, `knnMatch` `MatOfDMatch`s, darkest / min / max mats) and the per-row `mapY.row()` headers in `DewarpFilter.applyCylindricalPolynomialRemap`. Peak native set is still one CV_32FC3 accumulator plus the 8-bit darkest image and two gray planes. ORB / `DescriptorMatcher` are released only by finalizer.
+  - **Gemini (Scaffolder), still open from Pass 2 / 2b:** `ndk { abiFilters += "arm64-v8a" }` (APK ~166MB); OpenCV 4.9.0 `.so`s are not 16KB-aligned (targetSdk 35+); long spreads may exceed WorkManager's 10-minute window → `setForeground`; book-name UI (hardcoded "BookScan"); replace deprecated `setTargetAspectRatio` with `ResolutionSelector`; LAN URL is hardcoded `192.168.1.100`; each spread append rewrites the whole volume (O(n²) I/O plus a transient second copy against the storage budget) — consider per-spread PDFs merged at volume close. Orphaned partial-spread shots are already fixed.
+
+---
+
+## Pass 4 — Claude (re-audit of Grok Pass 3)
+* **Last Updated:** 2026-11-03 | Claude (Auditor & Safety Guard)
+* **Build:** `testDebugUnitTest` (9/9), `assembleDebug`, `lintDebug` → **BUILD SUCCESSFUL**. Still not run on a device or on a real page image.
+* **Mat lifetimes in the Pass 3 code: clean.** Every `Mat` in `accumulateAlignedShots` / `alignToBase` / `updateSpecularReferences` / `replaceSpecularWithDarkest` is released on all paths, including `continue` and early `return`. The `knnMatch` `MatOfDMatch` list is released. The OpenCV 4.9 binding releases its own temporary Mat (checked with `javap`). The `mapY.row(y)` headers are released per row. ORB / `DescriptorMatcher` have no `release()` in the Java API (only `clear()` + finalizer). Their native footprint is KBs, so they are left as is.
+* **Fixed:**
+  - `StitcherEngine.divideByWeight` was the real native peak, not the accumulator. A full `split` + float `merge` held 3×CV_32FC1 + a second CV_32FC3 while the base frame was still resident. At 12MP the peak was **~620MB native**. It now handles one float plane at a time (`extractChannel` → divide → 8-bit), and `baseMat` / `accumulator` / `weight` / specular refs are released as soon as they are consumed. The stitch peak is now in the alignment loop at **~360MB**. `baseGray` is freed after the downscale, and each candidate frame is freed right after its warp.
+  - `DewarpFilter.applyCylindricalPolynomialRemap`: the full-frame `mapX`/`mapY` were allocated before the `try`. An OOM `CvException` on the second leaked the first. They are now allocated inside the `try`.
+* **Math findings for Grok (checked numerically, not changed):**
+  - **Baseline centroid aliases at half a line pitch.** The centroid of |Sobel Y| in a fixed row band only tracks a vertical text shift up to ~½ line pitch (~0.5% of page height at typical pitch). Beyond that it wraps (synthetic pitch 47px: true 1.0% H → measured −0.18%; true 3.0% → +0.06%). The ±4% clamp lets the estimator report values well past the range it can measure, so real gutter sag of 1–3% comes out as noise or the wrong sign. Suggest 1-D cross-correlation of the spine-strip row profile against the mid-strip profile, or tracking per-line baselines.
+  - **Wide gutter shadows fall back to center.** With a Gaussian shadow at 0.52·W, `spineGutter` finds it for σ ≤ 2% of spread width but returns the 0.50 fallback for σ = 3% (depth 30) and σ = 5% (any depth), which is a thick-book gutter. Cause: the shoulder window (`width/40` = 2.5%) lands on the valley slope, and `maxWidth` = 6%. An 80px miss at 4000px leaves the shadow on one page.
+  - **Fusion ghosting risk (needs a real-image test).** One homography cannot register a curled page, so mean fusion may double text near the gutter. The specular rule (max ≥ 245, range ≥ 20) also fires on misaligned text edges when paper exposes near-white, which replaces them with the darkest shot and bolds or ghosts the text.
+  - Minor: `estimateBaselinePolynomial` runs Sobel on the full page to read three 16px strips. Run it on the strip ROIs instead.
+* **Modified Files:** `vision/StitcherEngine.kt`, `vision/DewarpFilter.kt`, `HANDOFF.md`.
+* **Target for Next Agent:**
+  - **Grok:** the three math findings above. The baseline aliasing is the priority, because the dewarp currently acts on measurement noise for most real sags. Add a `PageGeometryTest` case for a wide (σ ≥ 3%) gutter.
+  - **Gemini:** the Pass 3 open list is unchanged (ABI filter, 16KB alignment, `setForeground`, book-name UI, `ResolutionSelector`, LAN URL, O(n²) volume rewrite).

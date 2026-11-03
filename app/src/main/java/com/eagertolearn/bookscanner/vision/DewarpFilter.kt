@@ -10,8 +10,6 @@ import org.opencv.core.Size
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import java.io.File
-import kotlin.math.cos
-import kotlin.math.pow
 
 /**
  * Geometric polynomial baseline unrolling + cylindrical spine unwrapping + LAB L-channel CLAHE.
@@ -21,6 +19,9 @@ import kotlin.math.pow
  * - Applies CLAHE only to the L (luminance) channel in CIE LAB color space so yellow/pink/green
  *   highlighter ink and pencil marginalia are preserved intact.
  * - Releases every native OpenCV [Mat] in explicit `finally` blocks.
+ * - Remap maps are full-frame CV_32FC1 (required by [Imgproc.remap]) plus two 1-row headers.
+ *   They are released before the function returns. Column shifts are precomputed once; rows are
+ *   filled with Core ops rather than a per-pixel `pow`.
  */
 class DewarpFilter(
     private val claheClipLimit: Double = 2.0,
@@ -33,15 +34,15 @@ class DewarpFilter(
     }
 
     /**
-     * Polynomial coefficients $y(u) = a \cdot u^2 + b \cdot u + c$ describing normalized
-     * vertical page curvature across normalized horizontal coordinate $u \in [0, 1]$
-     * where $u = 0$ is the spine edge and $u = 1$ is the outer margin.
+     * Baseline displacement `δ(u) = a2·u² + a1·u + a0` as a fraction of image height.
+     * `u = 0` is the spine edge and `u = 1` is the outer margin, in the source image.
+     * [spineAngleRad] is the cylindrical gutter tilt passed through to the horizontal unwrap.
      */
     data class BaselinePolynomial(
         val a2: Float,
         val a1: Float,
         val a0: Float,
-        val spineRadiusFactor: Float = 0.14f
+        val spineAngleRad: Float = PageGeometry.SPINE_ANGLE_RAD
     )
 
     /**
@@ -81,8 +82,14 @@ class DewarpFilter(
     }
 
     /**
-     * Estimates quadratic text-line baseline droop $y(u) = a_2 u^2 + a_1 u + a_0$ near the spine.
-     * Note for Grok review: verify polynomial baseline fitting & spine-gutter boundary conditions.
+     * Fits `δ(u) = a2·u² + a1·u + a0` through three source-image stations so the curve
+     * actually interpolates them: spine, mid-page (displacement 0), and outer margin.
+     *
+     * The station value is the vertical center of mass of horizontal edges (|Sobel Y|) in the
+     * middle half of the page. A column shift of every text line moves that center of mass by
+     * the same amount, so δ is a displacement in units of image height, not a vertical scale.
+     * Differences are clamped (±4% of page height at the spine, ±2% at the outer edge) so a
+     * single rule or figure cannot throw the page.
      */
     fun estimateBaselinePolynomial(srcBgr: Mat, pageSide: PageSide): BaselinePolynomial {
         val gray = Mat()
@@ -99,11 +106,14 @@ class DewarpFilter(
                 return BaselinePolynomial(a2 = 0f, a1 = 0f, a0 = 0f)
             }
 
-            // Sample 3 horizontal stations (near-spine, mid-page, outer-page) in the central vertical zone
-            val sampleU = floatArrayOf(0.08f, 0.50f, 0.90f)
+            val sampleU = floatArrayOf(
+                PageGeometry.STATION_SPINE,
+                PageGeometry.STATION_MID,
+                PageGeometry.STATION_OUTER
+            )
             val centroidsY = FloatArray(3)
             val bandTop = (rows * 0.25).toInt()
-            val bandHeight = (rows * 0.50).toInt()
+            val bandHeight = (rows * 0.50).toInt().coerceAtLeast(1)
 
             for (idx in sampleU.indices) {
                 val u = sampleU[idx]
@@ -131,17 +141,23 @@ class DewarpFilter(
                 }
             }
 
-            // Fit quadratic displacement relative to mid-page station
-            val dySpine = (centroidsY[0] - centroidsY[1]).coerceIn(-0.08f, 0.08f)
-            val dyOuter = (centroidsY[2] - centroidsY[1]).coerceIn(-0.04f, 0.04f)
-
-            val a2 = (dySpine + dyOuter) * 0.5f
-            val a1 = dyOuter - dySpine
+            // Centroid is normalized to the middle band, which is half the page.
+            val bandFraction = bandHeight.toFloat() / rows.toFloat()
+            val dSpine = ((centroidsY[0] - centroidsY[1]) * bandFraction).coerceIn(-0.04f, 0.04f)
+            val dOuter = ((centroidsY[2] - centroidsY[1]) * bandFraction).coerceIn(-0.02f, 0.02f)
+            val quadratic = PageGeometry.fitQuadratic(
+                u0 = sampleU[0],
+                d0 = dSpine,
+                u1 = sampleU[1],
+                d1 = 0f,
+                u2 = sampleU[2],
+                d2 = dOuter
+            )
             return BaselinePolynomial(
-                a2 = a2,
-                a1 = a1,
-                a0 = 0f,
-                spineRadiusFactor = 0.14f
+                a2 = quadratic.a2,
+                a1 = quadratic.a1,
+                a0 = quadratic.a0,
+                spineAngleRad = PageGeometry.SPINE_ANGLE_RAD
             )
         } finally {
             absGradY.release()
@@ -151,8 +167,14 @@ class DewarpFilter(
     }
 
     /**
-     * Builds 2D lookup matrices (`mapX`, `mapY`) combining cylindrical horizontal unwrapping
-     * near the spine and polynomial vertical baseline correction, then executes [Imgproc.remap].
+     * Builds `mapX` / `mapY` and runs [Imgproc.remap].
+     *
+     * Horizontal: destination arc-length `u` reads source spine-distance
+     * [PageGeometry.cylindricalImageU], which is compressed toward the spine so the gutter
+     * is expanded. Vertical: `mapY = y + δ(u_source) · (height − 1)`. δ is the fitted
+     * baseline displacement at the source column being sampled, so a line that sags near the
+     * spine is pulled back. It is not a scale about the page center — the centroid measurement
+     * is a translation, and a scale would move the top and bottom in opposite directions.
      */
     fun applyCylindricalPolynomialRemap(
         srcBgr: Mat,
@@ -162,43 +184,50 @@ class DewarpFilter(
     ) {
         val width = srcBgr.cols()
         val height = srcBgr.rows()
+        if (width < 2 || height < 2) {
+            srcBgr.copyTo(dstBgr)
+            return
+        }
 
-        val mapX = Mat(height, width, CvType.CV_32FC1)
-        val mapY = Mat(height, width, CvType.CV_32FC1)
+        val widthDenom = (width - 1).toFloat()
+        val heightDenom = (height - 1).toFloat()
+        val maxDelta = heightDenom * MAX_DISPLACEMENT
+        val quadratic = PageGeometry.Quadratic(poly.a2, poly.a1, poly.a0)
+        val sourceX = FloatArray(width)
+        val deltaY = FloatArray(width)
+        for (x in 0 until width) {
+            val normX = x.toFloat() / widthDenom
+            val arcU = if (pageSide == PageSide.LEFT) 1f - normX else normX
+            val imageU = PageGeometry.cylindricalImageU(arcU, poly.spineAngleRad)
+            val mappedNormX = if (pageSide == PageSide.LEFT) 1f - imageU else imageU
+            sourceX[x] = mappedNormX * widthDenom
+            deltaY[x] = (quadratic.eval(imageU) * heightDenom).coerceIn(-maxDelta, maxDelta)
+        }
+
+        // Empty headers first, allocated inside the try: a CvException from the second
+        // full-frame allocation (the OOM case) must not leak the first.
+        val mapX = Mat()
+        val mapY = Mat()
+        val xRow = Mat()
+        val yRow = Mat()
         try {
-            val rowBufX = FloatArray(width)
-            val colNormU = FloatArray(width)
-            val sourceXForCol = FloatArray(width)
+            xRow.create(1, width, CvType.CV_32FC1)
+            yRow.create(1, width, CvType.CV_32FC1)
+            xRow.put(0, 0, sourceX)
+            yRow.put(0, 0, deltaY)
+            Core.repeat(xRow, height, 1, mapX)
+            Core.repeat(yRow, height, 1, mapY)
 
-            // Precompute horizontal cylindrical unwrapping per column
-            for (x in 0 until width) {
-                val normX = x.toFloat() / (width - 1).coerceAtLeast(1).toFloat()
-                // Distance from spine: u = 0 at spine, u = 1 at outer edge
-                val u = if (pageSide == PageSide.LEFT) 1f - normX else normX
-                colNormU[x] = u
-
-                // Cylindrical foreshortening compensation within the inner 25% spine region
-                val spineZone = (1f - (u / 0.25f)).coerceIn(0f, 1f)
-                val cylindricalShift = poly.spineRadiusFactor * (1f - cos(spineZone * (Math.PI / 4.0)).toFloat())
-                val correctedU = (u - cylindricalShift).coerceIn(0f, 1f)
-                val mappedNormX = if (pageSide == PageSide.LEFT) 1f - correctedU else correctedU
-
-                sourceXForCol[x] = mappedNormX * (width - 1)
-                rowBufX[x] = sourceXForCol[x]
-            }
-
-            val rowBufY = FloatArray(width)
+            val maxY = (height - 1).toDouble()
             for (y in 0 until height) {
-                val normY = (y.toFloat() / (height - 1).coerceAtLeast(1).toFloat()) - 0.5f
-                for (x in 0 until width) {
-                    val u = colNormU[x]
-                    val polyOffset = poly.a2 * (1f - u).pow(2) + poly.a1 * (1f - u) + poly.a0
-                    val radialScale = 1f + polyOffset * normY
-                    val srcY = ((normY * radialScale) + 0.5f) * (height - 1)
-                    rowBufY[x] = srcY.coerceIn(0f, (height - 1).toFloat())
+                val row = mapY.row(y)
+                try {
+                    Core.add(row, Scalar(y.toDouble()), row)
+                    Imgproc.threshold(row, row, maxY, 0.0, Imgproc.THRESH_TRUNC)
+                    Imgproc.threshold(row, row, 0.0, 0.0, Imgproc.THRESH_TOZERO)
+                } finally {
+                    row.release()
                 }
-                mapX.put(y, 0, rowBufX)
-                mapY.put(y, 0, rowBufY)
             }
 
             Imgproc.remap(
@@ -211,6 +240,8 @@ class DewarpFilter(
                 Scalar(255.0, 255.0, 255.0)
             )
         } finally {
+            yRow.release()
+            xRow.release()
             mapY.release()
             mapX.release()
         }
@@ -249,5 +280,10 @@ class DewarpFilter(
             }
             labMat.release()
         }
+    }
+
+    private companion object {
+        /** Hard cap on |δ| so extrapolation past the outer stations cannot shove a line off the page. */
+        const val MAX_DISPLACEMENT = 0.06f
     }
 }

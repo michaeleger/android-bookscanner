@@ -71,4 +71,6 @@ dependencies {
 
     // OpenCV Android SDK (Maven Central 4.9.0+ AAR)
     implementation(libs.opencv)
+
+    testImplementation(libs.junit)
 }

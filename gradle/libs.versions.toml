@@ -13,6 +13,7 @@ mlkitTextRecognition = "19.0.0"
 pdfboxAndroid = "2.0.27.0"
 okhttp = "4.12.0"
 opencv = "4.9.0"
+junit = "4.13.2"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -32,6 +33,7 @@ mlkit-text-recognition = { group = "com.google.android.gms", name = "play-servic
 pdfbox-android = { group = "com.tom-roush", name = "pdfbox-android", version.ref = "pdfboxAndroid" }
 okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
 opencv = { group = "org.opencv", name = "opencv", version.ref = "opencv" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

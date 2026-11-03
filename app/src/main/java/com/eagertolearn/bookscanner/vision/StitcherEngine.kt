@@ -11,11 +11,17 @@ import org.opencv.core.MatOfKeyPoint
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
 import org.opencv.core.Rect
+import org.opencv.core.Scalar
+import org.opencv.core.Size
 import org.opencv.features2d.DescriptorMatcher
 import org.opencv.features2d.ORB
 import org.opencv.imgcodecs.Imgcodecs
 import org.opencv.imgproc.Imgproc
 import java.io.File
+import kotlin.math.abs
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.roundToInt
 
 /**
  * Multi-shot spread registration, glare-suppressing fusion, and spine-gutter page splitter.
@@ -24,6 +30,9 @@ import java.io.File
  * - Operates strictly disk-to-disk via [Imgcodecs.imread] and [Imgcodecs.imwrite];
  *   never allocates JVM [android.graphics.Bitmap] objects.
  * - Releases every OpenCV native [Mat] in explicit `finally` blocks.
+ * - Fusion keeps one CV_32FC3 accumulator (the running sum) plus 8-bit weight, darkest-color,
+ *   and luminance mats. It does not keep every warped shot resident, so a 4-shot 12MP burst
+ *   stays one pipeline instead of four full float frames.
  */
 class StitcherEngine {
 
@@ -54,100 +63,138 @@ class StitcherEngine {
         }
 
         val accumulator = Mat()
+        val weight = Mat()
+        val darkest = Mat()
+        val minGray = Mat()
+        val maxGray = Mat()
+        val fusedBgr = Mat()
         try {
             baseMat.convertTo(accumulator, CvType.CV_32FC3)
-            var fusedCount = 1
+            weight.create(baseMat.rows(), baseMat.cols(), CvType.CV_8UC1)
+            weight.setTo(Scalar(1.0))
+            baseMat.copyTo(darkest)
+            Imgproc.cvtColor(baseMat, minGray, Imgproc.COLOR_BGR2GRAY)
+            minGray.copyTo(maxGray)
 
             if (shotFiles.size > 1) {
-                val orb = ORB.create(1500)
-                val matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING)
-                val noMask = Mat()
-                val baseGray = Mat()
-                val baseKeypoints = MatOfKeyPoint()
-                val baseDescriptors = Mat()
-
-                try {
-                    Imgproc.cvtColor(baseMat, baseGray, Imgproc.COLOR_BGR2GRAY)
-                    orb.detectAndCompute(baseGray, noMask, baseKeypoints, baseDescriptors)
-
-                    for (i in 1 until shotFiles.size) {
-                        val candidateFile = shotFiles[i]
-                        val candidateMat = Imgcodecs.imread(candidateFile.absolutePath, Imgcodecs.IMREAD_COLOR)
-                        val warpedCandidate = Mat()
-                        try {
-                            if (candidateMat.empty()) continue
-
-                            val aligned = alignToBase(
-                                orb = orb,
-                                matcher = matcher,
-                                noMask = noMask,
-                                baseKeypoints = baseKeypoints,
-                                baseDescriptors = baseDescriptors,
-                                candidateBgr = candidateMat,
-                                targetSize = baseMat.size(),
-                                dstWarped = warpedCandidate
-                            )
-
-                            if (aligned) {
-                                // Accumulates 8U into the 32F accumulator in place, avoiding a
-                                // full-resolution CV_32FC3 temporary (~144MB at 12MP) per shot.
-                                Imgproc.accumulate(warpedCandidate, accumulator)
-                                fusedCount += 1
-                            }
-                        } finally {
-                            warpedCandidate.release()
-                            candidateMat.release()
-                        }
-                    }
-                } finally {
-                    baseDescriptors.release()
-                    baseKeypoints.release()
-                    baseGray.release()
-                    noMask.release()
-                }
-            }
-
-            val fusedBgr = Mat()
-            try {
-                accumulator.convertTo(fusedBgr, CvType.CV_8UC3, 1.0 / fusedCount.toDouble())
-
-                val gutterX = detectSpineGutterColumn(fusedBgr)
-                val leftRect = Rect(0, 0, gutterX, fusedBgr.rows())
-                val rightRect = Rect(gutterX, 0, fusedBgr.cols() - gutterX, fusedBgr.rows())
-
-                val leftPageFile = File(outputDir, "spread_${spreadIndex}_left_raw.jpg")
-                val rightPageFile = File(outputDir, "spread_${spreadIndex}_right_raw.jpg")
-
-                val leftSubMat = fusedBgr.submat(leftRect)
-                try {
-                    check(Imgcodecs.imwrite(leftPageFile.absolutePath, leftSubMat)) {
-                        "Failed to write ${leftPageFile.absolutePath}"
-                    }
-                } finally {
-                    leftSubMat.release()
-                }
-
-                val rightSubMat = fusedBgr.submat(rightRect)
-                try {
-                    check(Imgcodecs.imwrite(rightPageFile.absolutePath, rightSubMat)) {
-                        "Failed to write ${rightPageFile.absolutePath}"
-                    }
-                } finally {
-                    rightSubMat.release()
-                }
-
-                return@withContext SplitSpreadResult(
-                    spreadIndex = spreadIndex,
-                    leftPageFile = leftPageFile,
-                    rightPageFile = rightPageFile,
-                    detectedGutterX = gutterX
+                accumulateAlignedShots(
+                    baseMat = baseMat,
+                    shotFiles = shotFiles,
+                    accumulator = accumulator,
+                    weight = weight,
+                    darkest = darkest,
+                    minGray = minGray,
+                    maxGray = maxGray
                 )
-            } finally {
-                fusedBgr.release()
             }
+
+            // The base frame is no longer read; free it before the division allocates.
+            baseMat.release()
+            divideByWeight(accumulator, weight, fusedBgr)
+            accumulator.release()
+            weight.release()
+            replaceSpecularWithDarkest(fusedBgr, darkest, minGray, maxGray)
+            darkest.release()
+            minGray.release()
+            maxGray.release()
+
+            val gutter = detectSpineGutter(fusedBgr)
+            val leftPageFile = File(outputDir, "spread_${spreadIndex}_left_raw.jpg")
+            val rightPageFile = File(outputDir, "spread_${spreadIndex}_right_raw.jpg")
+            writePage(fusedBgr, 0, gutter.leftEdge, leftPageFile)
+            writePage(fusedBgr, gutter.rightEdge, fusedBgr.cols() - gutter.rightEdge, rightPageFile)
+
+            return@withContext SplitSpreadResult(
+                spreadIndex = spreadIndex,
+                leftPageFile = leftPageFile,
+                rightPageFile = rightPageFile,
+                detectedGutterX = gutter.center
+            )
         } finally {
+            fusedBgr.release()
+            maxGray.release()
+            minGray.release()
+            darkest.release()
+            weight.release()
             accumulator.release()
             baseMat.release()
+        }
+    }
+
+    /**
+     * ORB runs on a long edge of [DETECT_LONG_EDGE], then match coordinates are scaled back
+     * to full resolution before RANSAC so the reprojection threshold stays in full-res pixels.
+     * Each accepted shot is accumulated only where its warped coverage mask is set, and feeds
+     * the per-pixel min/max luminance used later to spot glare.
+     */
+    private fun accumulateAlignedShots(
+        baseMat: Mat,
+        shotFiles: List<File>,
+        accumulator: Mat,
+        weight: Mat,
+        darkest: Mat,
+        minGray: Mat,
+        maxGray: Mat
+    ) {
+        val orb = ORB.create(1500)
+        val matcher = DescriptorMatcher.create(DescriptorMatcher.BRUTEFORCE_HAMMING)
+        val noMask = Mat()
+        val baseGray = Mat()
+        val baseSmall = Mat()
+        val baseKeypoints = MatOfKeyPoint()
+        val baseDescriptors = Mat()
+        try {
+            Imgproc.cvtColor(baseMat, baseGray, Imgproc.COLOR_BGR2GRAY)
+            val longEdge = max(baseMat.cols(), baseMat.rows()).toDouble()
+            val detectScale = min(1.0, DETECT_LONG_EDGE / longEdge)
+            val smallWidth = max(32, (baseMat.cols() * detectScale).roundToInt())
+            val smallHeight = max(32, (baseMat.rows() * detectScale).roundToInt())
+            val smallSize = Size(smallWidth.toDouble(), smallHeight.toDouble())
+            Imgproc.resize(baseGray, baseSmall, smallSize, 0.0, 0.0, Imgproc.INTER_AREA)
+            baseGray.release()
+            val baseScaleX = smallWidth.toDouble() / baseMat.cols().toDouble()
+            val baseScaleY = smallHeight.toDouble() / baseMat.rows().toDouble()
+            orb.detectAndCompute(baseSmall, noMask, baseKeypoints, baseDescriptors)
+            if (baseDescriptors.empty()) return
+
+            for (i in 1 until shotFiles.size) {
+                val candidateMat = Imgcodecs.imread(shotFiles[i].absolutePath, Imgcodecs.IMREAD_COLOR)
+                val warped = Mat()
+                val coverage = Mat()
+                try {
+                    if (candidateMat.empty()) continue
+                    val aligned = alignToBase(
+                        orb = orb,
+                        matcher = matcher,
+                        noMask = noMask,
+                        baseSmallSize = smallSize,
+                        baseScaleX = baseScaleX,
+                        baseScaleY = baseScaleY,
+                        baseKeypoints = baseKeypoints,
+                        baseDescriptors = baseDescriptors,
+                        candidateBgr = candidateMat,
+                        targetSize = baseMat.size(),
+                        dstWarped = warped,
+                        dstMask = coverage
+                    )
+                    // The warp is the only copy needed from here on.
+                    candidateMat.release()
+                    if (!aligned) continue
+                    Imgproc.accumulate(warped, accumulator, coverage)
+                    Core.add(weight, Scalar(1.0), weight, coverage)
+                    updateSpecularReferences(warped, coverage, darkest, minGray, maxGray)
+                } finally {
+                    coverage.release()
+                    warped.release()
+                    candidateMat.release()
+                }
+            }
+        } finally {
+            baseDescriptors.release()
+            baseKeypoints.release()
+            baseSmall.release()
+            baseGray.release()
+            noMask.release()
         }
     }
 
@@ -155,103 +202,287 @@ class StitcherEngine {
         orb: ORB,
         matcher: DescriptorMatcher,
         noMask: Mat,
+        baseSmallSize: Size,
+        baseScaleX: Double,
+        baseScaleY: Double,
         baseKeypoints: MatOfKeyPoint,
         baseDescriptors: Mat,
         candidateBgr: Mat,
-        targetSize: org.opencv.core.Size,
-        dstWarped: Mat
+        targetSize: Size,
+        dstWarped: Mat,
+        dstMask: Mat
     ): Boolean {
         if (baseDescriptors.empty()) return false
 
         val candidateGray = Mat()
+        val candidateSmall = Mat()
         val candidateKeypoints = MatOfKeyPoint()
         val candidateDescriptors = Mat()
-        val matches = MatOfDMatch()
+        val knnMatches = ArrayList<MatOfDMatch>()
         var srcPts: MatOfPoint2f? = null
         var dstPts: MatOfPoint2f? = null
         var homography: Mat? = null
+        var inlierMask: Mat? = null
+        val ones = Mat()
+        var erodeKernel: Mat? = null
 
         try {
             Imgproc.cvtColor(candidateBgr, candidateGray, Imgproc.COLOR_BGR2GRAY)
-            orb.detectAndCompute(candidateGray, noMask, candidateKeypoints, candidateDescriptors)
+            Imgproc.resize(candidateGray, candidateSmall, baseSmallSize, 0.0, 0.0, Imgproc.INTER_AREA)
+            orb.detectAndCompute(candidateSmall, noMask, candidateKeypoints, candidateDescriptors)
             if (candidateDescriptors.empty()) return false
 
-            matcher.match(candidateDescriptors, baseDescriptors, matches)
-            val matchArray = matches.toArray()
-            if (matchArray.size < MIN_GOOD_MATCHES) return false
+            matcher.knnMatch(candidateDescriptors, baseDescriptors, knnMatches, 2)
+            val goodMatches = ArrayList<org.opencv.core.DMatch>(knnMatches.size)
+            for (pair in knnMatches) {
+                val neighbors = pair.toArray()
+                if (neighbors.size >= 2 && neighbors[0].distance < LOWE_RATIO * neighbors[1].distance) {
+                    goodMatches.add(neighbors[0])
+                }
+            }
+            if (goodMatches.size < MIN_GOOD_MATCHES) return false
 
-            val goodMatches = matchArray
-                .sortedBy { it.distance }
-                .take((matchArray.size * 0.25).toInt().coerceAtLeast(MIN_GOOD_MATCHES))
-
-            val candKpArray = candidateKeypoints.toArray()
-            val baseKpArray = baseKeypoints.toArray()
-
+            val candScaleX = candidateSmall.cols().toDouble() / candidateBgr.cols().toDouble()
+            val candScaleY = candidateSmall.rows().toDouble() / candidateBgr.rows().toDouble()
+            val candKp = candidateKeypoints.toArray()
+            val baseKp = baseKeypoints.toArray()
             val srcPointList = ArrayList<Point>(goodMatches.size)
             val dstPointList = ArrayList<Point>(goodMatches.size)
-            for (m in goodMatches) {
-                srcPointList.add(candKpArray[m.queryIdx].pt)
-                dstPointList.add(baseKpArray[m.trainIdx].pt)
+            for (match in goodMatches) {
+                val query = candKp[match.queryIdx].pt
+                val train = baseKp[match.trainIdx].pt
+                srcPointList.add(Point(query.x / candScaleX, query.y / candScaleY))
+                dstPointList.add(Point(train.x / baseScaleX, train.y / baseScaleY))
             }
 
             srcPts = MatOfPoint2f(*srcPointList.toTypedArray())
             dstPts = MatOfPoint2f(*dstPointList.toTypedArray())
-
-            homography = Calib3d.findHomography(srcPts, dstPts, Calib3d.RANSAC, 4.0)
+            inlierMask = Mat()
+            homography = Calib3d.findHomography(
+                srcPts,
+                dstPts,
+                Calib3d.RANSAC,
+                RANSAC_REPROJ_PX,
+                inlierMask
+            )
             if (homography == null || homography.empty()) return false
+            if (Core.countNonZero(inlierMask) < MIN_GOOD_MATCHES) return false
+            if (!homographyIsPlausible(homography, targetSize.width.toInt(), targetSize.height.toInt())) {
+                return false
+            }
 
-            Imgproc.warpPerspective(candidateBgr, dstWarped, homography, targetSize)
+            ones.create(candidateBgr.rows(), candidateBgr.cols(), CvType.CV_8UC1)
+            ones.setTo(Scalar(255.0))
+            Imgproc.warpPerspective(
+                candidateBgr,
+                dstWarped,
+                homography,
+                targetSize,
+                Imgproc.INTER_LINEAR,
+                Core.BORDER_CONSTANT,
+                Scalar(0.0, 0.0, 0.0)
+            )
+            Imgproc.warpPerspective(
+                ones,
+                dstMask,
+                homography,
+                targetSize,
+                Imgproc.INTER_NEAREST,
+                Core.BORDER_CONSTANT,
+                Scalar(0.0)
+            )
+            // Drop the rim where linear sampling blended valid pixels with the black border.
+            erodeKernel = Imgproc.getStructuringElement(Imgproc.MORPH_RECT, Size(3.0, 3.0))
+            Imgproc.erode(dstMask, dstMask, erodeKernel)
             return !dstWarped.empty()
         } finally {
+            erodeKernel?.release()
+            ones.release()
+            inlierMask?.release()
             homography?.release()
             dstPts?.release()
             srcPts?.release()
-            matches.release()
+            for (pair in knnMatches) {
+                pair.release()
+            }
             candidateDescriptors.release()
             candidateKeypoints.release()
+            candidateSmall.release()
             candidateGray.release()
         }
     }
 
     /**
-     * Locates the vertical spine-gutter shadow trough inside the central [35%, 65%] horizontal band.
+     * A handheld burst is a small nudge of the same page. Reject homographies that scale,
+     * translate, or shear it into a different document.
      */
-    private fun detectSpineGutterColumn(spreadBgr: Mat): Int {
-        val width = spreadBgr.cols()
-        val height = spreadBgr.rows()
-        if (width < 20 || height < 20) return width / 2
+    private fun homographyIsPlausible(homography: Mat, width: Int, height: Int): Boolean {
+        if (homography.rows() != 3 || homography.cols() != 3) return false
+        val h00 = homography.get(0, 0)[0]
+        val h01 = homography.get(0, 1)[0]
+        val h02 = homography.get(0, 2)[0]
+        val h10 = homography.get(1, 0)[0]
+        val h11 = homography.get(1, 1)[0]
+        val h12 = homography.get(1, 2)[0]
+        val h20 = homography.get(2, 0)[0]
+        val h21 = homography.get(2, 1)[0]
+        val det = h00 * h11 - h01 * h10
+        if (det < 0.6 || det > 1.6) return false
+        if (abs(h02) > width * 0.15) return false
+        if (abs(h12) > height * 0.15) return false
+        if (abs(h20) * width > 0.2) return false
+        if (abs(h21) * height > 0.2) return false
+        return true
+    }
 
-        val startX = (width * 0.35).toInt()
-        val endX = (width * 0.65).toInt()
-        val bandRect = Rect(startX, 0, endX - startX, height)
-
-        val bandBgr = spreadBgr.submat(bandRect)
-        val bandGray = Mat()
-        val colSums = Mat()
+    /**
+     * Tracks the darkest valid color and the max luminance. Black warp borders stay out via
+     * [validMask], so they cannot win the minimum.
+     */
+    private fun updateSpecularReferences(
+        warped: Mat,
+        validMask: Mat,
+        darkest: Mat,
+        minGray: Mat,
+        maxGray: Mat
+    ) {
+        val candGray = Mat()
+        val darker = Mat()
+        val darkerValid = Mat()
+        val raised = Mat()
         try {
-            Imgproc.cvtColor(bandBgr, bandGray, Imgproc.COLOR_BGR2GRAY)
-            Core.reduce(bandGray, colSums, 0, Core.REDUCE_AVG, CvType.CV_32F)
-
-            val profile = FloatArray(colSums.cols())
-            colSums.get(0, 0, profile)
-
-            var minVal = Float.MAX_VALUE
-            var minOffset = profile.size / 2
-            for (i in profile.indices) {
-                if (profile[i] < minVal) {
-                    minVal = profile[i]
-                    minOffset = i
-                }
-            }
-            return startX + minOffset
+            Imgproc.cvtColor(warped, candGray, Imgproc.COLOR_BGR2GRAY)
+            Core.compare(candGray, minGray, darker, Core.CMP_LT)
+            Core.bitwise_and(darker, validMask, darkerValid)
+            warped.copyTo(darkest, darkerValid)
+            candGray.copyTo(minGray, darkerValid)
+            Core.max(maxGray, candGray, raised)
+            raised.copyTo(maxGray, validMask)
         } finally {
-            colSums.release()
-            bandGray.release()
-            bandBgr.release()
+            raised.release()
+            darkerValid.release()
+            darker.release()
+            candGray.release()
         }
     }
 
-    companion object {
-        private const val MIN_GOOD_MATCHES = 12
+    /**
+     * One float plane at a time: extract, divide, narrow to 8-bit, release. A full split plus
+     * a float merge would hold three extra CV_32FC1 planes and a second CV_32FC3 frame
+     * (~290MB at 12MP) on top of the accumulator.
+     */
+    private fun divideByWeight(accumulator: Mat, weight: Mat, dst8: Mat) {
+        val weight32 = Mat()
+        val plane32 = Mat()
+        val planes8 = ArrayList<Mat>(3)
+        try {
+            weight.convertTo(weight32, CvType.CV_32FC1)
+            for (c in 0 until accumulator.channels()) {
+                Core.extractChannel(accumulator, plane32, c)
+                Core.divide(plane32, weight32, plane32)
+                val plane8 = Mat()
+                planes8.add(plane8)
+                plane32.convertTo(plane8, CvType.CV_8UC1)
+            }
+            plane32.release()
+            weight32.release()
+            Core.merge(planes8, dst8)
+        } finally {
+            for (plane in planes8) {
+                plane.release()
+            }
+            plane32.release()
+            weight32.release()
+        }
+    }
+
+    /**
+     * Min-of-specular: where one shot clipped and another did not, write the darkest valid
+     * color. The weighted mean is kept everywhere else, so stable paper still gets the
+     * noise reduction of the burst. If the "specular" mask covers more than
+     * [MAX_SPECULAR_FRACTION] of the frame, the exposure itself changed and we do not replace.
+     */
+    private fun replaceSpecularWithDarkest(
+        fused: Mat,
+        darkest: Mat,
+        minGray: Mat,
+        maxGray: Mat
+    ) {
+        val range = Mat()
+        val hot = Mat()
+        val varied = Mat()
+        val specular = Mat()
+        try {
+            Core.subtract(maxGray, minGray, range)
+            Imgproc.threshold(maxGray, hot, SPECULAR_LEVEL, 255.0, Imgproc.THRESH_BINARY)
+            Imgproc.threshold(range, varied, GLARE_MARGIN, 255.0, Imgproc.THRESH_BINARY)
+            Core.bitwise_and(hot, varied, specular)
+            val pixels = fused.rows() * fused.cols()
+            if (pixels <= 0) return
+            val fraction = Core.countNonZero(specular).toDouble() / pixels.toDouble()
+            if (fraction > 0.0 && fraction <= MAX_SPECULAR_FRACTION) {
+                darkest.copyTo(fused, specular)
+            }
+        } finally {
+            specular.release()
+            varied.release()
+            hot.release()
+            range.release()
+        }
+    }
+
+    private fun detectSpineGutter(spreadBgr: Mat): PageGeometry.GutterSplit {
+        val width = spreadBgr.cols()
+        val height = spreadBgr.rows()
+        if (width < 20 || height < 20) {
+            val mid = width / 2
+            return PageGeometry.GutterSplit(mid, mid, mid)
+        }
+
+        val top = (height * 0.15).toInt()
+        val roiHeight = (height * 0.70).toInt().coerceAtLeast(1).coerceAtMost(height - top)
+        val band = spreadBgr.submat(Rect(0, top, width, roiHeight))
+        val bandGray = Mat()
+        val colMeans = Mat()
+        try {
+            Imgproc.cvtColor(band, bandGray, Imgproc.COLOR_BGR2GRAY)
+            Core.reduce(bandGray, colMeans, 0, Core.REDUCE_AVG, CvType.CV_32F)
+            val profile = FloatArray(colMeans.cols())
+            colMeans.get(0, 0, profile)
+            return PageGeometry.spineGutter(profile)
+        } finally {
+            colMeans.release()
+            bandGray.release()
+            band.release()
+        }
+    }
+
+    private fun writePage(fusedBgr: Mat, x: Int, pageWidth: Int, outputFile: File) {
+        val safeX = x.coerceIn(0, fusedBgr.cols() - 1)
+        val safeWidth = pageWidth.coerceIn(1, fusedBgr.cols() - safeX)
+        val page = fusedBgr.submat(Rect(safeX, 0, safeWidth, fusedBgr.rows()))
+        try {
+            check(Imgcodecs.imwrite(outputFile.absolutePath, page)) {
+                "Failed to write ${outputFile.absolutePath}"
+            }
+        } finally {
+            page.release()
+        }
+    }
+
+    private companion object {
+        const val MIN_GOOD_MATCHES = 12
+        const val LOWE_RATIO = 0.75
+        const val RANSAC_REPROJ_PX = 4.0
+        const val DETECT_LONG_EDGE = 960.0
+
+        /** Near-clipped gray level. White paper usually sits below this; a highlight does not. */
+        const val SPECULAR_LEVEL = 245.0
+
+        /** Min/max luminance gap, in gray levels, required before a hot pixel is called glare. */
+        const val GLARE_MARGIN = 20.0
+
+        /** Above this fraction the brightness change is exposure, not a highlight. */
+        const val MAX_SPECULAR_FRACTION = 0.35
     }
 }
